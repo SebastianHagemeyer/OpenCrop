@@ -92,8 +92,9 @@ python scan_index.py workScans\workscan10Dpretest.pdf
 # Define question regions (opens Tkinter GUI; takes ~10–15s to index first)
 python make_template.py workScans\workscan10Dpretest.pdf
 
-# Extract per-question crops — NOT YET BUILT
-# python extract.py workScans\workscan10Dpretest.pdf templates\workscan10Dpretest.yaml output\
+# Extract per-question crops to disk (optional — see "on-the-fly" below)
+python extract.py workScans\workscan10Dpretest.pdf workscan10Dpretest.yaml output\
+# Custom DPI: --dpi 400
 ```
 
 ## On-the-fly crop access (preferred for the marker)
