@@ -1,4 +1,4 @@
-"""Tkinter GUI for defining per-question regions on a reference student's pages.
+"""PySide6 GUI for defining per-question regions on a reference student's pages.
 
 Usage:
     python make_template.py [path/to/scan.pdf]
@@ -18,14 +18,28 @@ Workflow:
 from __future__ import annotations
 
 import sys
-import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 import pymupdf
 import yaml
-from PIL import Image, ImageTk
+from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap, QShortcut, QKeySequence
+from PySide6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
 from scan_index import StudentGroup, group_into_students, index_pdf
 
@@ -34,25 +48,124 @@ DISPLAY_DPI = 180     # rendering dpi for the on-screen image
 MIN_BBOX = 0.01       # ignore drags smaller than 1% of page (likely accidental)
 
 
-class TemplateEditor:
-    def __init__(self, root: tk.Tk, pdf_path: Path) -> None:
-        self.root = root
+class PageView(QWidget):
+    """Custom widget: renders a page pixmap, overlays region rectangles, and emits
+    normalized bbox coords when the user finishes dragging a new rectangle."""
+
+    rect_drawn = Signal(float, float, float, float)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setCursor(Qt.CrossCursor)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setAutoFillBackground(True)
+        pal = self.palette()
+        pal.setColor(self.backgroundRole(), QColor(204, 204, 204))  # gray80-ish
+        self.setPalette(pal)
+
+        self._pixmap: QPixmap | None = None
+        self._regions: list[dict] = []
+        self._draw_start: QPoint | None = None
+        self._draw_end: QPoint | None = None
+
+    def set_page(self, pixmap: QPixmap, regions: list[dict]) -> None:
+        self._pixmap = pixmap
+        self._regions = regions
+        self._draw_start = None
+        self._draw_end = None
+        self.update()
+
+    def _layout(self) -> tuple[float, int, int]:
+        """Return (scale, scaled_w, scaled_h) for the current pixmap+widget size."""
+        if self._pixmap is None:
+            return 1.0, 0, 0
+        cw = max(self.width(), 1)
+        ch = max(self.height(), 1)
+        pw, ph = self._pixmap.width(), self._pixmap.height()
+        if pw == 0 or ph == 0:
+            return 1.0, 0, 0
+        scale = min(cw / pw, ch / ph)
+        return scale, max(1, int(pw * scale)), max(1, int(ph * scale))
+
+    def paintEvent(self, _ev) -> None:
+        painter = QPainter(self)
+        if self._pixmap is None:
+            return
+        scale, sw, sh = self._layout()
+        painter.drawPixmap(0, 0, self._pixmap.scaled(
+            sw, sh, Qt.KeepAspectRatio, Qt.SmoothTransformation,
+        ))
+
+        pw, ph = self._pixmap.width(), self._pixmap.height()
+        red = QPen(QColor("red"), 2)
+        painter.setPen(red)
+        font = QFont()
+        font.setBold(True)
+        font.setPointSize(12)
+        painter.setFont(font)
+        for r in self._regions:
+            x0, y0, x1, y1 = r["bbox"]
+            cx0, cy0 = x0 * pw * scale, y0 * ph * scale
+            cx1, cy1 = x1 * pw * scale, y1 * ph * scale
+            painter.drawRect(int(cx0), int(cy0), int(cx1 - cx0), int(cy1 - cy0))
+            painter.drawText(int(cx0 + 4), int(cy0 + 18), r["q"])
+
+        if self._draw_start is not None and self._draw_end is not None:
+            preview = QPen(QColor("blue"), 2, Qt.DashLine)
+            painter.setPen(preview)
+            x0 = min(self._draw_start.x(), self._draw_end.x())
+            y0 = min(self._draw_start.y(), self._draw_end.y())
+            x1 = max(self._draw_start.x(), self._draw_end.x())
+            y1 = max(self._draw_start.y(), self._draw_end.y())
+            painter.drawRect(x0, y0, x1 - x0, y1 - y0)
+
+    def mousePressEvent(self, ev) -> None:
+        if self._pixmap is None:
+            return
+        self._draw_start = ev.position().toPoint()
+        self._draw_end = self._draw_start
+        self.update()
+
+    def mouseMoveEvent(self, ev) -> None:
+        if self._draw_start is None:
+            return
+        self._draw_end = ev.position().toPoint()
+        self.update()
+
+    def mouseReleaseEvent(self, ev) -> None:
+        if self._draw_start is None or self._pixmap is None:
+            return
+        scale, _, _ = self._layout()
+        pw, ph = self._pixmap.width(), self._pixmap.height()
+        end = ev.position().toPoint()
+        x0c, y0c = self._draw_start.x(), self._draw_start.y()
+        x1c, y1c = end.x(), end.y()
+        self._draw_start = None
+        self._draw_end = None
+        self.update()
+        if scale <= 0 or pw == 0 or ph == 0:
+            return
+        nx0 = max(0.0, min(x0c, x1c) / scale / pw)
+        ny0 = max(0.0, min(y0c, y1c) / scale / ph)
+        nx1 = min(1.0, max(x0c, x1c) / scale / pw)
+        ny1 = min(1.0, max(y0c, y1c) / scale / ph)
+        if (nx1 - nx0) < MIN_BBOX or (ny1 - ny0) < MIN_BBOX:
+            return
+        self.rect_drawn.emit(nx0, ny0, nx1, ny1)
+
+
+class TemplateEditor(QMainWindow):
+    def __init__(self, pdf_path: Path) -> None:
+        super().__init__()
         self.pdf_path = pdf_path
-        self.root.title(f"Template editor — {self.pdf_path.name}")
+        self.setWindowTitle(f"Template editor — {self.pdf_path.name}")
 
         self.doc: pymupdf.Document | None = None
         self.groups: list[StudentGroup] = []
         self.current_group_idx = 0
         self.current_page_idx = 0
-        self.regions: list[dict] = []         # [{q, page, bbox}]
+        self.regions: list[dict] = []
         self.next_q_num = 1
-
-        self.tk_img: ImageTk.PhotoImage | None = None
-        self.img_dims: tuple[int, int] = (1, 1)
-        self.display_scale = 1.0
-
-        self.draw_start: tuple[int, int] | None = None
-        self.preview_rect: int | None = None
 
         self._build_ui()
         self._load_pdf(self.pdf_path)
@@ -60,82 +173,104 @@ class TemplateEditor:
     # ---------- UI construction ----------
 
     def _build_ui(self) -> None:
-        top = ttk.Frame(self.root, padding=4)
-        top.pack(side="top", fill="x")
-        ttk.Button(top, text="Open PDF…", command=self._open_pdf_dialog).pack(side="left")
-        ttk.Label(top, text="  Reference student: ").pack(side="left")
-        self.student_var = tk.StringVar()
-        self.student_combo = ttk.Combobox(top, textvariable=self.student_var, state="readonly", width=30)
-        self.student_combo.bind("<<ComboboxSelected>>", lambda e: self._on_student_change())
-        self.student_combo.pack(side="left")
-        self.page_label = ttk.Label(top, text="")
-        self.page_label.pack(side="left", padx=12)
+        central = QWidget()
+        self.setCentralWidget(central)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(4, 4, 4, 4)
 
-        body = ttk.Frame(self.root)
-        body.pack(side="top", fill="both", expand=True)
+        top = QHBoxLayout()
+        open_btn = QPushButton("Open PDF…")
+        open_btn.clicked.connect(self._open_pdf_dialog)
+        top.addWidget(open_btn)
+        top.addWidget(QLabel("  Reference student: "))
+        self.student_combo = QComboBox()
+        self.student_combo.setMinimumWidth(220)
+        self.student_combo.currentIndexChanged.connect(self._on_student_change)
+        top.addWidget(self.student_combo)
+        self.page_label = QLabel("")
+        top.addSpacing(12)
+        top.addWidget(self.page_label)
+        top.addStretch(1)
+        outer.addLayout(top)
 
-        self.canvas = tk.Canvas(body, bg="gray80", cursor="crosshair", highlightthickness=0)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.canvas.bind("<ButtonPress-1>", self._on_press)
-        self.canvas.bind("<B1-Motion>", self._on_drag)
-        self.canvas.bind("<ButtonRelease-1>", self._on_release)
-        self.canvas.bind("<Configure>", lambda e: self._render_current_page())
+        body = QHBoxLayout()
+        outer.addLayout(body, 1)
 
-        side = ttk.Frame(body, padding=8)
-        side.pack(side="right", fill="y")
-        side.configure(width=260)
-        side.pack_propagate(False)
+        self.page_view = PageView()
+        self.page_view.rect_drawn.connect(self._on_rect_drawn)
+        body.addWidget(self.page_view, 1)
 
-        ttk.Label(side, text="Defining:").pack(anchor="w")
-        self.defining_label = ttk.Label(side, text="Q01", font=("TkDefaultFont", 14, "bold"))
-        self.defining_label.pack(anchor="w")
+        side = QFrame()
+        side.setFixedWidth(260)
+        side_lay = QVBoxLayout(side)
+        side_lay.setContentsMargins(8, 8, 8, 8)
+        body.addWidget(side)
 
-        ttk.Separator(side).pack(fill="x", pady=8)
-        ttk.Label(side, text="Regions defined:").pack(anchor="w")
-        self.region_list = tk.Listbox(side, height=18)
-        self.region_list.pack(fill="both", expand=True, pady=(2, 4))
-        ttk.Button(side, text="Delete selected", command=self._delete_selected).pack(fill="x")
+        side_lay.addWidget(QLabel("Defining:"))
+        self.defining_label = QLabel("Q01")
+        big = QFont()
+        big.setPointSize(14)
+        big.setBold(True)
+        self.defining_label.setFont(big)
+        side_lay.addWidget(self.defining_label)
 
-        ttk.Separator(side).pack(fill="x", pady=8)
-        nav = ttk.Frame(side)
-        nav.pack(fill="x")
-        ttk.Button(nav, text="◀ Prev page", command=self._prev_page).pack(side="left", expand=True, fill="x")
-        ttk.Button(nav, text="Next page ▶", command=self._next_page).pack(side="left", expand=True, fill="x")
+        side_lay.addSpacing(8)
+        side_lay.addWidget(QLabel("Regions defined:"))
+        self.region_list = QListWidget()
+        side_lay.addWidget(self.region_list, 1)
+        del_btn = QPushButton("Delete selected")
+        del_btn.clicked.connect(self._delete_selected)
+        side_lay.addWidget(del_btn)
 
-        ttk.Button(side, text="Save template…", command=self._save).pack(fill="x", pady=(8, 0))
+        side_lay.addSpacing(8)
+        nav = QHBoxLayout()
+        prev_btn = QPushButton("◀ Prev page")
+        prev_btn.clicked.connect(self._prev_page)
+        next_btn = QPushButton("Next page ▶")
+        next_btn.clicked.connect(self._next_page)
+        nav.addWidget(prev_btn)
+        nav.addWidget(next_btn)
+        side_lay.addLayout(nav)
 
-        self.root.bind("<Left>", lambda e: self._prev_page())
-        self.root.bind("<Right>", lambda e: self._next_page())
+        save_btn = QPushButton("Save template…")
+        save_btn.clicked.connect(self._save)
+        side_lay.addWidget(save_btn)
+
+        QShortcut(QKeySequence(Qt.Key_Left), self, activated=self._prev_page)
+        QShortcut(QKeySequence(Qt.Key_Right), self, activated=self._next_page)
 
     # ---------- PDF loading / indexing ----------
 
     def _open_pdf_dialog(self) -> None:
-        path = filedialog.askopenfilename(filetypes=[("PDF", "*.pdf")])
+        path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF (*.pdf)")
         if not path:
             return
         self._load_pdf(Path(path))
 
     def _load_pdf(self, path: Path) -> None:
-        self.root.title(f"Template editor — {path.name}  (indexing…)")
-        self.root.update_idletasks()
+        self.setWindowTitle(f"Template editor — {path.name}  (indexing…)")
+        QApplication.processEvents()
         if self.doc is not None:
             self.doc.close()
         self.doc = pymupdf.open(path)
         pages = index_pdf(path, dpi=INDEX_DPI)
         self.groups = [g for g in group_into_students(pages) if g.student_class != "UNKNOWN"]
         if not self.groups:
-            messagebox.showerror("No students found", "Could not decode any QR codes in this PDF.")
+            QMessageBox.critical(self, "No students found", "Could not decode any QR codes in this PDF.")
             return
         self.pdf_path = path
         self.current_group_idx = 0
         self.current_page_idx = 0
         self.regions.clear()
         self.next_q_num = 1
-        self.student_combo["values"] = [g.folder_name for g in self.groups]
-        self.student_combo.current(0)
+        self.student_combo.blockSignals(True)
+        self.student_combo.clear()
+        self.student_combo.addItems([g.folder_name for g in self.groups])
+        self.student_combo.setCurrentIndex(0)
+        self.student_combo.blockSignals(False)
         self._refresh_region_list()
         self._render_current_page()
-        self.root.title(f"Template editor — {path.name}")
+        self.setWindowTitle(f"Template editor — {path.name}")
 
     # ---------- State accessors ----------
 
@@ -158,74 +293,23 @@ class TemplateEditor:
         zoom = DISPLAY_DPI / 72.0
         pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
         arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-        pil = Image.fromarray(arr)
-        self.img_dims = pil.size
-
-        cw = max(self.canvas.winfo_width(), 200)
-        ch = max(self.canvas.winfo_height(), 200)
-        scale = min(cw / pil.width, ch / pil.height)
-        self.display_scale = scale
-        new_size = (max(1, int(pil.width * scale)), max(1, int(pil.height * scale)))
-        pil = pil.resize(new_size, Image.LANCZOS)
-        self.tk_img = ImageTk.PhotoImage(pil)
-
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor="nw", image=self.tk_img)
+        # Copy through QImage so the QPixmap doesn't reference pix.samples after pix is freed.
+        qimg = QImage(arr.data, pix.width, pix.height, pix.stride, QImage.Format_RGB888).copy()
+        pixmap = QPixmap.fromImage(qimg)
 
         page_in_packet = self._current_page_in_packet()
-        w, h = self.img_dims
-        for r in self.regions:
-            if r["page"] != page_in_packet:
-                continue
-            x0, y0, x1, y1 = r["bbox"]
-            cx0, cy0 = x0 * w * scale, y0 * h * scale
-            cx1, cy1 = x1 * w * scale, y1 * h * scale
-            self.canvas.create_rectangle(cx0, cy0, cx1, cy1, outline="red", width=2)
-            self.canvas.create_text(
-                cx0 + 4, cy0 + 4, anchor="nw", text=r["q"],
-                fill="red", font=("TkDefaultFont", 12, "bold"),
-            )
+        regions_for_page = [r for r in self.regions if r["page"] == page_in_packet]
+        self.page_view.set_page(pixmap, regions_for_page)
 
         n_pages = len(self._current_group().pages)
-        self.page_label.config(text=f"Packet page {self._current_page_in_packet()} of {n_pages}  (PDF page {pdf_pg})")
-        self.defining_label.config(text=f"Q{self.next_q_num:02d}")
-
-    # ---------- Mouse interaction ----------
-
-    def _on_press(self, event: tk.Event) -> None:
-        self.draw_start = (event.x, event.y)
-        if self.preview_rect is not None:
-            self.canvas.delete(self.preview_rect)
-        self.preview_rect = self.canvas.create_rectangle(
-            event.x, event.y, event.x, event.y,
-            outline="blue", width=2, dash=(4, 2),
+        self.page_label.setText(
+            f"Packet page {page_in_packet} of {n_pages}  (PDF page {pdf_pg})"
         )
+        self.defining_label.setText(f"Q{self.next_q_num:02d}")
 
-    def _on_drag(self, event: tk.Event) -> None:
-        if self.draw_start is None or self.preview_rect is None:
-            return
-        x0, y0 = self.draw_start
-        self.canvas.coords(self.preview_rect, x0, y0, event.x, event.y)
+    # ---------- Region handling ----------
 
-    def _on_release(self, event: tk.Event) -> None:
-        if self.draw_start is None:
-            return
-        x0, y0 = self.draw_start
-        x1, y1 = event.x, event.y
-        if self.preview_rect is not None:
-            self.canvas.delete(self.preview_rect)
-        self.preview_rect = None
-        self.draw_start = None
-
-        w, h = self.img_dims
-        s = self.display_scale
-        nx0 = max(0.0, min(x0, x1) / s / w)
-        ny0 = max(0.0, min(y0, y1) / s / h)
-        nx1 = min(1.0, max(x0, x1) / s / w)
-        ny1 = min(1.0, max(y0, y1) / s / h)
-        if (nx1 - nx0) < MIN_BBOX or (ny1 - ny0) < MIN_BBOX:
-            return
-
+    def _on_rect_drawn(self, nx0: float, ny0: float, nx1: float, ny1: float) -> None:
         self.regions.append({
             "q": f"Q{self.next_q_num:02d}",
             "page": self._current_page_in_packet(),
@@ -235,12 +319,10 @@ class TemplateEditor:
         self._refresh_region_list()
         self._render_current_page()
 
-    # ---------- Region list management ----------
-
     def _refresh_region_list(self) -> None:
-        self.region_list.delete(0, "end")
+        self.region_list.clear()
         for r in self.regions:
-            self.region_list.insert("end", f"{r['q']}  page {r['page']}")
+            self.region_list.addItem(f"{r['q']}  page {r['page']}")
 
     def _renumber(self) -> None:
         for i, r in enumerate(self.regions, start=1):
@@ -248,18 +330,20 @@ class TemplateEditor:
         self.next_q_num = len(self.regions) + 1
 
     def _delete_selected(self) -> None:
-        sel = self.region_list.curselection()
-        if not sel:
+        row = self.region_list.currentRow()
+        if row < 0:
             return
-        del self.regions[sel[0]]
+        del self.regions[row]
         self._renumber()
         self._refresh_region_list()
         self._render_current_page()
 
     # ---------- Navigation ----------
 
-    def _on_student_change(self) -> None:
-        self.current_group_idx = self.student_combo.current()
+    def _on_student_change(self, idx: int) -> None:
+        if idx < 0:
+            return
+        self.current_group_idx = idx
         self.current_page_idx = 0
         self._render_current_page()
 
@@ -277,15 +361,14 @@ class TemplateEditor:
 
     def _save(self) -> None:
         if not self.regions:
-            messagebox.showwarning("Nothing to save", "Define some regions first.")
+            QMessageBox.warning(self, "Nothing to save", "Define some regions first.")
             return
         pages_per_student = len(self._current_group().pages)
         templates_dir = self.pdf_path.parent / "templates"
-        path = filedialog.asksaveasfilename(
-            defaultextension=".yaml",
-            initialfile=f"{self.pdf_path.stem}.yaml",
-            initialdir=str(templates_dir if templates_dir.exists() else self.pdf_path.parent),
-            filetypes=[("YAML", "*.yaml")],
+        initial_dir = templates_dir if templates_dir.exists() else self.pdf_path.parent
+        initial_path = str(initial_dir / f"{self.pdf_path.stem}.yaml")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save template", initial_path, "YAML (*.yaml)"
         )
         if not path:
             return
@@ -302,18 +385,21 @@ class TemplateEditor:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             yaml.safe_dump(template, f, sort_keys=False)
-        messagebox.showinfo("Saved", f"Wrote {len(regions_sorted)} regions to:\n{path}")
+        QMessageBox.information(self, "Saved", f"Wrote {len(regions_sorted)} regions to:\n{path}")
+
+    # ---------- Resize hook (re-render so scaling stays sharp) ----------
+
+    def resizeEvent(self, ev) -> None:
+        super().resizeEvent(ev)
+        # PageView already redraws via its paintEvent on resize; nothing else to do.
 
 
 def main() -> None:
+    app = QApplication(sys.argv)
     if len(sys.argv) >= 2:
         pdf_path = Path(sys.argv[1])
     else:
-        # No CLI arg → ask user
-        root_tmp = tk.Tk()
-        root_tmp.withdraw()
-        chosen = filedialog.askopenfilename(filetypes=[("PDF", "*.pdf")])
-        root_tmp.destroy()
+        chosen, _ = QFileDialog.getOpenFileName(None, "Open PDF", "", "PDF (*.pdf)")
         if not chosen:
             sys.exit(0)
         pdf_path = Path(chosen)
@@ -322,10 +408,10 @@ def main() -> None:
         print(f"PDF not found: {pdf_path}")
         sys.exit(1)
 
-    root = tk.Tk()
-    root.geometry("1280x900")
-    TemplateEditor(root, pdf_path)
-    root.mainloop()
+    win = TemplateEditor(pdf_path)
+    win.resize(1280, 900)
+    win.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

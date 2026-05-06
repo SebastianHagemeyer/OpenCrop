@@ -1,5 +1,5 @@
 pymupdf>=1.27
 opencv-python>=4.10
 numpy>=2.0
-Pillow>=10.0
 PyYAML>=6.0
+PySide6>=6.7
