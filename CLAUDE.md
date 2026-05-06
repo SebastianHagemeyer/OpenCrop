@@ -7,7 +7,7 @@ This file is the handoff doc. It assumes you have not seen the conversation that
 ## Repo layout
 
 - `qr_probe.py` — one-shot CLI: prints the decoded QR string per page of a PDF.
-- `scan_index.py` — library + CLI: decodes QRs and groups consecutive same-name pages into per-student packets. Has retry preprocessing (Otsu, rescaling) and a packet-size rebalancer for QR-decode failures.
+- `scan_index.py` — library + CLI: decodes QRs and groups pages into per-student packets using the page/total embedded in each QR. Has retry preprocessing (Otsu, rescaling) and neighbour-based inference for any pages whose QR still won't decode.
 - `make_template.py` — Tkinter GUI: pick a reference student, click+drag rectangles for each question on each page, save to YAML.
 - `extract.py` — CLI: applies a template to a PDF, writes per-student crops + a manifest. Useful for archiving, sharing answers, or feeding a marker that doesn't want pymupdf/opencv as deps. NOT required for on-the-fly access (see below).
 - `requirements.txt` — pymupdf, opencv-python, numpy, Pillow, PyYAML.
@@ -20,16 +20,17 @@ This file is the handoff doc. It assumes you have not seen the conversation that
 Each page has one QR encoding the literal string:
 
 ```
-<class>/<firstname>
+<class>/<firstname>/<page>/<total>
 ```
 
-Examples from `workScans/workscan10Dpretest.pdf`: `10MATD/Ruby`, `10MATD/Ali`, `10MATD/Kierra`.
+Examples from `workScans/10MATD_combinedTEST.pdf`: `10MATD/Dj/1/2`, `10MATD/Ruby/2/2`, `10MATD/Amarni-Faith/1/2`.
 
-- `class` is constant across one PDF.
-- `firstname` is the only student identifier (no surname, no ID).
-- **The QR does not encode a page number.** Page-within-packet is inferred from PDF page order: consecutive pages with the same `firstname` belong to one student, in order. This is a known limitation — page numbers may be added to the QR in a future scan format.
+- `class` is **not** required to be constant across one PDF — a single scan can mix classes (e.g. `matpremix.pdf` contains both `10MATD` and `10MATG` packets).
+- `firstname` is the only student identifier (no surname, no ID). First-name collisions are scoped per `(class, firstname)`, so the same first name in two different classes is fine.
+- `page` / `total` give the page's position in this student's packet (1-based). This is authoritative — `scan_index.py` does not need PDF order to figure out packet structure.
+- A legacy 2-segment form (`<class>/<firstname>`, no page/total) is also accepted. Mixed in one PDF is fine. For legacy pages, packet position is reconstructed from the order the pages appear within their group.
 
-QR detection rate observed at 250 DPI: 36/40 raw, 40/40 with Otsu+rescaling fallback. If `scan_index.py` still can't decode a page, it attributes the page to the running student and may move it to the next student via packet-size rebalancing (see `_rebalance` in `scan_index.py`).
+QR detection rate on `10MATD_combinedTEST.pdf` at 250 DPI: 47/52 plain, 52/52 with the Otsu + rescaling fallback in `_decode_qr`. If a page still can't be decoded, `_infer_missing` in `scan_index.py` assigns it from the nearest decoded neighbour (e.g. a missing page immediately followed by `X/2/2` is inferred to be `X/1/2`). Pages with no usable neighbour stay `unknown` and are visible in the manifest.
 
 ## Output folder schema (what the marker iterates over)
 
@@ -84,16 +85,16 @@ questions:
 python -m pip install -r requirements.txt
 
 # Inspect raw QR contents of a scan (one line per page)
-python qr_probe.py workScans\workscan10Dpretest.pdf
+python qr_probe.py workScans\10MATD_combinedTEST.pdf
 
 # Show grouped student structure (one line per student)
-python scan_index.py workScans\workscan10Dpretest.pdf
+python scan_index.py workScans\10MATD_combinedTEST.pdf
 
 # Define question regions (opens Tkinter GUI; takes ~10–15s to index first)
-python make_template.py workScans\workscan10Dpretest.pdf
+python make_template.py workScans\10MATD_combinedTEST.pdf
 
 # Extract per-question crops to disk (optional — see "on-the-fly" below)
-python extract.py workScans\workscan10Dpretest.pdf workscan10Dpretest.yaml output\
+python extract.py workScans\10MATD_combinedTEST.pdf 10MATD_combinedTEST.yaml output\
 # Custom DPI: --dpi 400
 ```
 
@@ -106,9 +107,9 @@ from pathlib import Path
 import cv2, numpy as np, pymupdf, yaml
 from scan_index import group_into_students, index_pdf
 
-template = yaml.safe_load(Path("workscan10Dpretest.yaml").read_text())
-groups   = group_into_students(index_pdf(Path("workScans/workscan10Dpretest.pdf")))
-doc      = pymupdf.open("workScans/workscan10Dpretest.pdf")
+template = yaml.safe_load(Path("10MATD_combinedTEST.yaml").read_text())
+groups   = group_into_students(index_pdf(Path("workScans/10MATD_combinedTEST.pdf")))
+doc      = pymupdf.open("workScans/10MATD_combinedTEST.pdf")
 
 DPI = 300
 zoom = pymupdf.Matrix(DPI / 72.0, DPI / 72.0)
@@ -136,5 +137,5 @@ When pre-extraction wins: archiving graded exams, handing off without the origin
 
 - **Never commit `workScans/`, `output/`, `templates/`, or `*.pdf` / `roster*.csv`.** They contain student data. The `.gitignore` already excludes them; do not override with `git add -f`.
 - First-name-only identifier means two students sharing a first name in one class will collide. Current test class has no collisions; add disambiguation when needed.
-- If a future scan format encodes the page number in the QR (e.g. `10MATD/Ruby/1`), update `_parse_qr()` in `scan_index.py` to use the explicit page number instead of PDF-order inference, and consider dropping the rebalancing logic.
+- Legacy 2-segment QRs (`<class>/<firstname>`) are accepted as a fallback. Pages are grouped by `(class, name)` and packet position is reconstructed from PDF order within the group. This means legacy packets must be printed/scanned contiguously — interleaving two legacy packets with the same first name across the PDF will collapse them into one (mis-paginated) group. The 4-segment form is still preferred when you have control over the QR.
 - Image coords in templates are normalized — never store pixel coords, they break across DPIs.

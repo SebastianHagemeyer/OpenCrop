@@ -43,11 +43,17 @@ def crop_region(img: np.ndarray, bbox: list[float]) -> np.ndarray:
     return img[py0:py1, px0:px1]
 
 
-def extract(pdf_path: Path, template_path: Path, output_dir: Path, dpi: int) -> None:
+def extract(
+    pdf_path: Path,
+    template_path: Path,
+    output_dir: Path,
+    dpi: int,
+    exam_name_override: str | None = None,
+) -> None:
     template = yaml.safe_load(template_path.read_text(encoding="utf-8"))
     pages_per_student: int = template["pages_per_student"]
     questions: list[dict] = template["questions"]
-    exam_name: str = template.get("exam", pdf_path.stem)
+    exam_name: str = exam_name_override or template.get("exam", pdf_path.stem)
 
     template_pages = sorted({q["page"] for q in questions})
     if template_pages and max(template_pages) > pages_per_student:
@@ -140,6 +146,11 @@ def main() -> None:
     parser.add_argument("template", type=Path, help="Path to the template YAML")
     parser.add_argument("output", type=Path, help="Output directory")
     parser.add_argument("--dpi", type=int, default=EXTRACT_DPI, help=f"Render DPI (default {EXTRACT_DPI})")
+    parser.add_argument(
+        "--exam-name",
+        default=None,
+        help="Override the output subfolder name (defaults to template['exam'] or PDF stem)",
+    )
     args = parser.parse_args()
 
     if not args.pdf.exists():
@@ -147,7 +158,7 @@ def main() -> None:
     if not args.template.exists():
         sys.exit(f"Template not found: {args.template}")
 
-    extract(args.pdf, args.template, args.output, dpi=args.dpi)
+    extract(args.pdf, args.template, args.output, dpi=args.dpi, exam_name_override=args.exam_name)
 
 
 if __name__ == "__main__":

@@ -20,5 +20,6 @@ Thumbs.db
 workScans/
 output/
 extracted/
+templates/
 roster*.csv
 *.pdf
