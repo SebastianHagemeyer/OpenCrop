@@ -17,8 +17,29 @@ Workflow:
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+# When launched from qmark, the parent passes the marking scheme's question
+# codes via QMARK_QUESTION_CODES so regions adopt the scheme's structure
+# (e.g. "Q1,Q2,Q3,Q4") instead of always being numbered Q01..QNN. Empty
+# list = standalone behaviour (auto-incrementing Q01..).
+QUESTION_CODES = [
+    c.strip() for c in os.environ.get("QMARK_QUESTION_CODES", "").split(",")
+    if c.strip()
+]
+
+
+def _code_for(n: int) -> str:
+    """Return the label for the n-th region (1-based).
+
+    Uses the scheme's codes if provided and we haven't run out; otherwise
+    falls back to zero-padded Q01/Q02/... for any extra regions.
+    """
+    if QUESTION_CODES and 1 <= n <= len(QUESTION_CODES):
+        return QUESTION_CODES[n - 1]
+    return f"Q{n:02d}"
 
 import numpy as np
 import pymupdf
@@ -210,7 +231,7 @@ class TemplateEditor(QMainWindow):
         body.addWidget(side)
 
         side_lay.addWidget(QLabel("Defining:"))
-        self.defining_label = QLabel("Q01")
+        self.defining_label = QLabel(_code_for(1))
         big = QFont()
         big.setPointSize(14)
         big.setBold(True)
@@ -308,13 +329,13 @@ class TemplateEditor(QMainWindow):
         self.page_label.setText(
             f"Packet page {page_in_packet} of {n_pages}  (PDF page {pdf_pg})"
         )
-        self.defining_label.setText(f"Q{self.next_q_num:02d}")
+        self.defining_label.setText(_code_for(self.next_q_num))
 
     # ---------- Region handling ----------
 
     def _on_rect_drawn(self, nx0: float, ny0: float, nx1: float, ny1: float) -> None:
         self.regions.append({
-            "q": f"Q{self.next_q_num:02d}",
+            "q": _code_for(self.next_q_num),
             "page": self._current_page_in_packet(),
             "bbox": [round(nx0, 4), round(ny0, 4), round(nx1, 4), round(ny1, 4)],
         })
@@ -329,7 +350,7 @@ class TemplateEditor(QMainWindow):
 
     def _renumber(self) -> None:
         for i, r in enumerate(self.regions, start=1):
-            r["q"] = f"Q{i:02d}"
+            r["q"] = _code_for(i)
         self.next_q_num = len(self.regions) + 1
 
     def _delete_selected(self) -> None:
