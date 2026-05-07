@@ -24,7 +24,7 @@ import numpy as np
 import pymupdf
 import yaml
 from PySide6.QtCore import QPoint, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap, QShortcut, QKeySequence
+from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -46,6 +46,7 @@ from scan_index import StudentGroup, group_into_students, index_pdf
 INDEX_DPI = 200       # QR scan dpi (lower = faster startup)
 DISPLAY_DPI = 180     # rendering dpi for the on-screen image
 MIN_BBOX = 0.01       # ignore drags smaller than 1% of page (likely accidental)
+ICON_PATH = Path(__file__).resolve().parent / "paper.ico"
 
 
 class PageView(QWidget):
@@ -159,6 +160,8 @@ class TemplateEditor(QMainWindow):
         super().__init__()
         self.pdf_path = pdf_path
         self.setWindowTitle(f"Template editor — {self.pdf_path.name}")
+        if ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(ICON_PATH)))
 
         self.doc: pymupdf.Document | None = None
         self.groups: list[StudentGroup] = []
@@ -396,6 +399,8 @@ class TemplateEditor(QMainWindow):
 
 def main() -> None:
     app = QApplication(sys.argv)
+    if ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(ICON_PATH)))
     if len(sys.argv) >= 2:
         pdf_path = Path(sys.argv[1])
     else:

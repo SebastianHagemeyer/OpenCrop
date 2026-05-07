@@ -15,7 +15,7 @@ import threading
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -36,6 +36,7 @@ from scan_index import group_into_students, index_pdf
 HERE = Path(__file__).resolve().parent
 DEFAULT_PDF_REL = Path("workScans/10MATD_combinedTEST.pdf")
 OUTPUT_DIR = HERE / "output"
+ICON_PATH = HERE / "paper.ico"
 
 
 class Launcher(QMainWindow):
@@ -46,6 +47,8 @@ class Launcher(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Exam region extractor")
+        if ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.resize(820, 540)
         self.setMinimumSize(640, 360)
 
@@ -333,6 +336,8 @@ class Launcher(QMainWindow):
 
 def main() -> None:
     app = QApplication(sys.argv)
+    if ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(ICON_PATH)))
     win = Launcher()
     win.show()
     sys.exit(app.exec())
