@@ -171,7 +171,15 @@ class Launcher(QMainWindow):
         return None
 
     def _browse_pdf(self) -> None:
-        initial = HERE / "workScans" if (HERE / "workScans").is_dir() else HERE
+        # Prefer qmark's Data/Scans/ when launched from the dashboard, else
+        # the local workScans/ scratch folder, else the OpenCrop folder.
+        scans_dir = os.environ.get("QMARK_SCANS_DIR", "")
+        if scans_dir and Path(scans_dir).is_dir():
+            initial = Path(scans_dir)
+        elif (HERE / "workScans").is_dir():
+            initial = HERE / "workScans"
+        else:
+            initial = HERE
         picked, _ = QFileDialog.getOpenFileName(
             self, "Pick scan PDF", str(initial),
             "PDF files (*.pdf);;All files (*.*)",
