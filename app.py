@@ -36,7 +36,12 @@ from scan_index import group_into_students, index_pdf
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_PDF_REL = Path("workScans/10MATD_combinedTEST.pdf")
-OUTPUT_DIR = HERE / "output"
+# When launched from the qmark dashboard, write crops into qmark's
+# Student Work directory and use qmark's assignment name as the
+# per-exam folder, so the marker picks them up directly.
+_QMARK_WORK = os.environ.get("QMARK_WORK_DIR", "")
+QMARK_ASSIGNMENT_NAME = os.environ.get("QMARK_ASSIGNMENT_NAME", "").strip()
+OUTPUT_DIR = Path(_QMARK_WORK) if _QMARK_WORK else (HERE / "output")
 ICON_PATH = HERE / "paper.ico"
 
 
@@ -63,6 +68,8 @@ class Launcher(QMainWindow):
             self.pdf_edit.setText(str(default_pdf))
             self.exam_name_edit.setText(default_pdf.stem)
             self._autofill_template()
+        if QMARK_ASSIGNMENT_NAME:
+            self.exam_name_edit.setText(QMARK_ASSIGNMENT_NAME)
 
     # ---------- layout ----------
 
@@ -171,7 +178,10 @@ class Launcher(QMainWindow):
         )
         if picked:
             self.pdf_edit.setText(picked)
-            self.exam_name_edit.setText(Path(picked).stem)
+            # When running under qmark, the assignment name is the canonical
+            # output-folder name — don't clobber it with the PDF stem.
+            if not QMARK_ASSIGNMENT_NAME:
+                self.exam_name_edit.setText(Path(picked).stem)
             self._autofill_template()
 
     def _browse_template(self) -> None:
