@@ -8,8 +8,9 @@ underlying module directly (Check scan) or shells out to the existing CLI script
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
-import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -222,28 +223,39 @@ class Launcher(QMainWindow):
         pdf = self._pdf_path()
         if not pdf:
             return
-        script = HERE / "make_template.py"
-        if not script.exists():
-            QMessageBox.critical(self, "Missing script", f"Cannot find {script}")
-            return
         self._set_busy(True, "Region editor open — finish and close it to continue.")
         self._append_log(f"\n=== Opening region editor on {pdf.name} ===")
 
-        def work() -> None:
-            try:
-                proc = subprocess.run([sys.executable, str(script), str(pdf)], cwd=str(HERE))
-                self.log_signal.emit(f"Region editor closed (exit code {proc.returncode}).\n")
-                for c in (HERE / f"{pdf.stem}.yaml", HERE / "templates" / f"{pdf.stem}.yaml"):
-                    if c.exists():
-                        self.tpl_path_signal.emit(str(c))
-                        self.log_signal.emit(f"Template found: {c.name}\n")
-                        break
-            except Exception as e:
-                self.log_signal.emit(f"ERROR launching editor: {e}\n")
-            finally:
-                self.busy_signal.emit(False, "")
+        try:
+            from make_template import TemplateEditor
+        except Exception as e:
+            self._append_log(f"ERROR importing region editor: {e}\n")
+            self._set_busy(False, "")
+            return
 
-        self._run_in_thread(work)
+        try:
+            self._editor = TemplateEditor(pdf)
+        except Exception as e:
+            self._append_log(f"ERROR launching editor: {e}\n")
+            self._set_busy(False, "")
+            return
+        self._editor.setAttribute(Qt.WA_DeleteOnClose, True)
+        self._editor_pdf = pdf
+        self._editor.destroyed.connect(self._on_editor_closed)
+        self._editor.resize(1280, 900)
+        self._editor.show()
+
+    def _on_editor_closed(self, _obj: object | None = None) -> None:
+        pdf = getattr(self, "_editor_pdf", None)
+        self._editor = None
+        self.log_signal.emit("Region editor closed.\n")
+        if pdf is not None:
+            for c in (HERE / f"{pdf.stem}.yaml", HERE / "templates" / f"{pdf.stem}.yaml"):
+                if c.exists():
+                    self.tpl_path_signal.emit(str(c))
+                    self.log_signal.emit(f"Template found: {c.name}\n")
+                    break
+        self.busy_signal.emit(False, "")
 
     # ---------- stage 3: extract ----------
 
@@ -280,35 +292,35 @@ class Launcher(QMainWindow):
             )
             return
 
-        script = HERE / "extract.py"
         OUTPUT_DIR.mkdir(exist_ok=True)
         self._set_busy(True, "Extracting crops...")
         self._append_log(f"\n=== Extracting {pdf.name} with {tpl.name} -> output/{exam_name} ===")
 
+        log_signal = self.log_signal
+        busy_signal = self.busy_signal
+
+        class _LogStream(io.TextIOBase):
+            def write(self, s: str) -> int:
+                if s:
+                    log_signal.emit(s)
+                return len(s)
+
+            def flush(self) -> None:
+                pass
+
         def work() -> None:
             try:
-                proc = subprocess.Popen(
-                    [
-                        sys.executable, "-u", str(script),
-                        str(pdf), str(tpl), str(OUTPUT_DIR),
-                        "--exam-name", exam_name,
-                    ],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    cwd=str(HERE),
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    self.log_signal.emit(line)
-                proc.wait()
-                self.log_signal.emit(f"Extract finished (exit code {proc.returncode}).\n")
+                from extract import extract as run_extract
+
+                with contextlib.redirect_stdout(_LogStream()):
+                    run_extract(pdf, tpl, OUTPUT_DIR, dpi=300, exam_name_override=exam_name)
+                log_signal.emit("Extract finished.\n")
+            except SystemExit as e:
+                log_signal.emit(f"Extract aborted: {e}\n")
             except Exception as e:
-                self.log_signal.emit(f"ERROR: {e}\n")
+                log_signal.emit(f"ERROR: {e}\n")
             finally:
-                self.busy_signal.emit(False, "")
+                busy_signal.emit(False, "")
 
         self._run_in_thread(work)
 

@@ -23,3 +23,12 @@ extracted/
 templates/
 roster*.csv
 *.pdf
+
+# Nuitka build artifacts (binaries uploaded out-of-band, not tracked)
+dist/
+*.build/
+*.dist/
+*.onefile-build/
+
+# Claude Code agent local state
+.claude/

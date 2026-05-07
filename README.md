@@ -160,6 +160,21 @@ roster*.csv
 
 Don't override this with `git add -f`. If you fork this repo for your own school, keep the same exclusions.
 
+## Build a standalone Windows executable
+
+You can ship OpenCrop without asking the recipient to install Python. The build is driven by [Nuitka](https://nuitka.net), which compiles the Python sources to native code and bundles every dependency (PySide6, OpenCV, pymupdf, numpy, etc.) into a folder.
+
+```
+python -m pip install nuitka
+python build.py
+```
+
+First-time builds take 5–15 minutes (Nuitka may auto-download a C compiler if none is on PATH). Subsequent builds are faster because Nuitka caches compiled C objects.
+
+Output: `dist/app.dist/` — a self-contained folder with `OpenCrop.exe` and all required DLLs. Zip the folder and share it; the recipient runs `OpenCrop.exe` directly. No Python install required on their side.
+
+The compiled `.exe` uses `paper.ico` for both the file icon and the window icon.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
