@@ -41,7 +41,23 @@ DEFAULT_PDF_REL = Path("workScans/10MATD_combinedTEST.pdf")
 # per-exam folder, so the marker picks them up directly.
 _QMARK_WORK = os.environ.get("QMARK_WORK_DIR", "")
 QMARK_ASSIGNMENT_NAME = os.environ.get("QMARK_ASSIGNMENT_NAME", "").strip()
-OUTPUT_DIR = Path(_QMARK_WORK) if _QMARK_WORK else (HERE / "output")
+
+
+def _writable_output_root() -> Path:
+    """Per-user writable fallback for OpenCrop's output dir.
+
+    HERE is read-only inside an MSIX install, so writing crops to
+    HERE/output silently fails or gets virtualized into the per-package
+    container. Use %LOCALAPPDATA%\\OpenCrop\\output instead when
+    QMARK_WORK_DIR isn't supplied by the parent dashboard.
+    """
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    d = Path(base) / "OpenCrop" / "output"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+OUTPUT_DIR = Path(_QMARK_WORK) if _QMARK_WORK else _writable_output_root()
 ICON_PATH = HERE / "paper.ico"
 
 

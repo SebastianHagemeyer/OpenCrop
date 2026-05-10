@@ -70,6 +70,24 @@ MIN_BBOX = 0.01       # ignore drags smaller than 1% of page (likely accidental)
 ICON_PATH = Path(__file__).resolve().parent / "paper.ico"
 
 
+def _writable_templates_dir(pdf_path: Path) -> Path:
+    """Where to default the YAML template save dialog for `pdf_path`.
+
+    Prefer a templates/ folder next to the PDF (or the PDF's own dir),
+    but fall back to %LOCALAPPDATA%\\OpenCrop\\templates when that's
+    read-only — which is the case when the PDF lives under
+    Program Files\\WindowsApps inside an MSIX install.
+    """
+    natural = pdf_path.parent / "templates"
+    candidate = natural if natural.exists() else pdf_path.parent
+    if os.access(str(candidate), os.W_OK):
+        return candidate
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    fallback = Path(base) / "OpenCrop" / "templates"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
 class PageView(QWidget):
     """Custom widget: renders a page pixmap, overlays region rectangles, and emits
     normalized bbox coords when the user finishes dragging a new rectangle."""
@@ -388,8 +406,7 @@ class TemplateEditor(QMainWindow):
             QMessageBox.warning(self, "Nothing to save", "Define some regions first.")
             return
         pages_per_student = len(self._current_group().pages)
-        templates_dir = self.pdf_path.parent / "templates"
-        initial_dir = templates_dir if templates_dir.exists() else self.pdf_path.parent
+        initial_dir = _writable_templates_dir(self.pdf_path)
         initial_path = str(initial_dir / f"{self.pdf_path.stem}.yaml")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save template", initial_path, "YAML (*.yaml)"
