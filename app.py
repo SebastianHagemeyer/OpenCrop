@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from qmark_theme import apply_qmark_theme
 from scan_index import group_into_students, index_pdf
 
 HERE = Path(__file__).resolve().parent
@@ -382,6 +383,7 @@ class Launcher(QMainWindow):
 
 def main() -> None:
     app = QApplication(sys.argv)
+    apply_qmark_theme(app)
     if ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(ICON_PATH)))
     win = Launcher()
