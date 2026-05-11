@@ -42,6 +42,20 @@ DEFAULT_PDF_REL = Path("workScans/10MATD_combinedTEST.pdf")
 # per-exam folder, so the marker picks them up directly.
 _QMARK_WORK = os.environ.get("QMARK_WORK_DIR", "")
 QMARK_ASSIGNMENT_NAME = os.environ.get("QMARK_ASSIGNMENT_NAME", "").strip()
+QMARK_CLASS_NAME = os.environ.get("QMARK_CLASS_NAME", "").strip()
+
+
+def _qmark_output_name() -> str:
+    """Per-extraction subfolder name handed off by the dashboard.
+
+    <Class>_<Assignment> when both are present (so the marker can find
+    crops for the right cohort), or just <Assignment> if no class was
+    given. Empty string when neither is set — caller falls back to the
+    PDF stem.
+    """
+    if QMARK_CLASS_NAME and QMARK_ASSIGNMENT_NAME:
+        return f"{QMARK_CLASS_NAME}_{QMARK_ASSIGNMENT_NAME}"
+    return QMARK_ASSIGNMENT_NAME
 
 
 def _writable_output_root() -> Path:
@@ -59,6 +73,10 @@ def _writable_output_root() -> Path:
 
 
 OUTPUT_DIR = Path(_QMARK_WORK) if _QMARK_WORK else _writable_output_root()
+try:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
 ICON_PATH = HERE / "paper.ico"
 
 
@@ -85,8 +103,9 @@ class Launcher(QMainWindow):
             self.pdf_edit.setText(str(default_pdf))
             self.exam_name_edit.setText(default_pdf.stem)
             self._autofill_template()
-        if QMARK_ASSIGNMENT_NAME:
-            self.exam_name_edit.setText(QMARK_ASSIGNMENT_NAME)
+        qmark_output = _qmark_output_name()
+        if qmark_output:
+            self.exam_name_edit.setText(qmark_output)
 
     # ---------- layout ----------
 
@@ -171,8 +190,29 @@ class Launcher(QMainWindow):
             return None
         return p
 
+    def _template_search_paths(self, pdf_stem: str) -> list[Path]:
+        """Candidate template locations in preference order.
+
+        qmark's Sheets folder is checked first so a template saved there
+        from Define regions wins over older copies in HERE / HERE/templates.
+        """
+        paths: list[Path] = []
+        qmark_sheets = os.environ.get("QMARK_SHEETS_DIR", "").strip()
+        if qmark_sheets:
+            sheets_root = Path(qmark_sheets)
+            paths.append(sheets_root / f"{pdf_stem}.yaml")
+            paths.append(sheets_root / "templates" / f"{pdf_stem}.yaml")
+        paths.append(HERE / f"{pdf_stem}.yaml")
+        paths.append(HERE / "templates" / f"{pdf_stem}.yaml")
+        return paths
+
     def _template_path(self, pdf: Path) -> Path:
-        return HERE / f"{pdf.stem}.yaml"
+        """Best-guess template path when the user hasn't picked one — the
+        first candidate that exists, or the preferred save location."""
+        for c in self._template_search_paths(pdf.stem):
+            if c.exists():
+                return c
+        return self._template_search_paths(pdf.stem)[0]
 
     def _autofill_template(self) -> Path | None:
         pdf_str = self.pdf_edit.text().strip()
@@ -181,7 +221,7 @@ class Launcher(QMainWindow):
         pdf = Path(pdf_str)
         if not pdf.is_absolute():
             pdf = (HERE / pdf).resolve()
-        for c in (HERE / f"{pdf.stem}.yaml", HERE / "templates" / f"{pdf.stem}.yaml"):
+        for c in self._template_search_paths(pdf.stem):
             if c.exists():
                 self.tpl_edit.setText(str(c))
                 return c
@@ -203,14 +243,21 @@ class Launcher(QMainWindow):
         )
         if picked:
             self.pdf_edit.setText(picked)
-            # When running under qmark, the assignment name is the canonical
-            # output-folder name — don't clobber it with the PDF stem.
-            if not QMARK_ASSIGNMENT_NAME:
+            # When running under qmark, the dashboard's <Class>_<Assignment>
+            # is the canonical output-folder name — don't clobber it with
+            # the PDF stem.
+            if not _qmark_output_name():
                 self.exam_name_edit.setText(Path(picked).stem)
             self._autofill_template()
 
     def _browse_template(self) -> None:
-        initial = HERE / "templates" if (HERE / "templates").is_dir() else HERE
+        qmark_sheets = os.environ.get("QMARK_SHEETS_DIR", "").strip()
+        if qmark_sheets and Path(qmark_sheets).is_dir():
+            initial = Path(qmark_sheets)
+        elif (HERE / "templates").is_dir():
+            initial = HERE / "templates"
+        else:
+            initial = HERE
         picked, _ = QFileDialog.getOpenFileName(
             self, "Pick template YAML", str(initial),
             "YAML files (*.yaml *.yml);;All files (*.*)",
@@ -285,11 +332,14 @@ class Launcher(QMainWindow):
         self._editor = None
         self.log_signal.emit("Region editor closed.\n")
         if pdf is not None:
-            for c in (HERE / f"{pdf.stem}.yaml", HERE / "templates" / f"{pdf.stem}.yaml"):
-                if c.exists():
-                    self.tpl_path_signal.emit(str(c))
-                    self.log_signal.emit(f"Template found: {c.name}\n")
-                    break
+            # Pick whichever copy was written most recently — the editor
+            # may have left an older template in HERE while the user
+            # saved the new one into qmark's Sheets folder.
+            existing = [c for c in self._template_search_paths(pdf.stem) if c.exists()]
+            if existing:
+                latest = max(existing, key=lambda p: p.stat().st_mtime)
+                self.tpl_path_signal.emit(str(latest))
+                self.log_signal.emit(f"Template found: {latest}\n")
         self.busy_signal.emit(False, "")
 
     # ---------- stage 3: extract ----------

@@ -17,8 +17,10 @@ Workflow:
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import sys
+import threading
 from pathlib import Path
 
 # When launched from qmark, the parent passes the marking scheme's question
@@ -62,7 +64,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from scan_index import StudentGroup, group_into_students, index_pdf
+from scan_index import (
+    PageRecord, StudentGroup, _decode_qr, _parse_qr, _render_page,
+    group_into_students,
+)
 
 INDEX_DPI = 200       # QR scan dpi (lower = faster startup)
 DISPLAY_DPI = 180     # rendering dpi for the on-screen image
@@ -73,11 +78,22 @@ ICON_PATH = Path(__file__).resolve().parent / "paper.ico"
 def _writable_templates_dir(pdf_path: Path) -> Path:
     """Where to default the YAML template save dialog for `pdf_path`.
 
-    Prefer a templates/ folder next to the PDF (or the PDF's own dir),
-    but fall back to %LOCALAPPDATA%\\OpenCrop\\templates when that's
-    read-only — which is the case when the PDF lives under
+    Prefer the qmark Sheets folder when launched from the dashboard so
+    the template sits beside the worksheet PDF it describes. Otherwise a
+    templates/ folder next to the PDF (or the PDF's own dir), falling
+    back to %LOCALAPPDATA%\\OpenCrop\\templates when nothing writable
+    is reachable — that's the case when the PDF lives under
     Program Files\\WindowsApps inside an MSIX install.
     """
+    qmark_sheets = os.environ.get("QMARK_SHEETS_DIR", "").strip()
+    if qmark_sheets:
+        try:
+            d = Path(qmark_sheets)
+            d.mkdir(parents=True, exist_ok=True)
+            if os.access(str(d), os.W_OK):
+                return d
+        except OSError:
+            pass
     natural = pdf_path.parent / "templates"
     candidate = natural if natural.exists() else pdf_path.parent
     if os.access(str(candidate), os.W_OK):
@@ -107,13 +123,27 @@ class PageView(QWidget):
         self._regions: list[dict] = []
         self._draw_start: QPoint | None = None
         self._draw_end: QPoint | None = None
+        # Cache the smoothly-scaled pixmap keyed on (sw, sh) — scaling a
+        # 1500x2000 source on every paintEvent (which fires on every
+        # mouseMove during a drag) is the dominant cost in this widget.
+        self._scaled_cache: QPixmap | None = None
+        self._cache_dims: tuple[int, int] = (0, 0)
+
+    def _invalidate_cache(self) -> None:
+        self._scaled_cache = None
+        self._cache_dims = (0, 0)
 
     def set_page(self, pixmap: QPixmap, regions: list[dict]) -> None:
         self._pixmap = pixmap
         self._regions = regions
         self._draw_start = None
         self._draw_end = None
+        self._invalidate_cache()
         self.update()
+
+    def resizeEvent(self, ev) -> None:
+        super().resizeEvent(ev)
+        self._invalidate_cache()
 
     def _layout(self) -> tuple[float, int, int]:
         """Return (scale, scaled_w, scaled_h) for the current pixmap+widget size."""
@@ -132,9 +162,12 @@ class PageView(QWidget):
         if self._pixmap is None:
             return
         scale, sw, sh = self._layout()
-        painter.drawPixmap(0, 0, self._pixmap.scaled(
-            sw, sh, Qt.KeepAspectRatio, Qt.SmoothTransformation,
-        ))
+        if self._scaled_cache is None or self._cache_dims != (sw, sh):
+            self._scaled_cache = self._pixmap.scaled(
+                sw, sh, Qt.KeepAspectRatio, Qt.SmoothTransformation,
+            )
+            self._cache_dims = (sw, sh)
+        painter.drawPixmap(0, 0, self._scaled_cache)
 
         pw, ph = self._pixmap.width(), self._pixmap.height()
         red = QPen(QColor("red"), 2)
@@ -195,6 +228,17 @@ class PageView(QWidget):
 
 
 class TemplateEditor(QMainWindow):
+    # Signals fired from the background indexing worker back onto the UI
+    # thread. The token lets us ignore stale results from a previous load
+    # if the user opened a new PDF while the first one was still being
+    # indexed.
+    # `done=False` is an incremental update; `done=True` is the final
+    # emit after the whole PDF has been processed (legacy 2-segment QR
+    # groups without pages_total only show up on the final emit).
+    _groups_updated = Signal(int, str, list, bool, int, int)
+    # (token, pdf_path, groups, done, page_num, total_pages)
+    _index_failed = Signal(int, str)         # (token, error)
+
     def __init__(self, pdf_path: Path) -> None:
         super().__init__()
         self.pdf_path = pdf_path
@@ -208,8 +252,12 @@ class TemplateEditor(QMainWindow):
         self.current_page_idx = 0
         self.regions: list[dict] = []
         self.next_q_num = 1
+        self._index_token = 0
+
 
         self._build_ui()
+        self._groups_updated.connect(self._on_groups_updated)
+        self._index_failed.connect(self._on_index_failed)
         self._load_pdf(self.pdf_path)
 
     # ---------- UI construction ----------
@@ -260,23 +308,23 @@ class TemplateEditor(QMainWindow):
         side_lay.addWidget(QLabel("Regions defined:"))
         self.region_list = QListWidget()
         side_lay.addWidget(self.region_list, 1)
-        del_btn = QPushButton("Delete selected")
-        del_btn.clicked.connect(self._delete_selected)
-        side_lay.addWidget(del_btn)
+        self.del_btn = QPushButton("Delete selected")
+        self.del_btn.clicked.connect(self._delete_selected)
+        side_lay.addWidget(self.del_btn)
 
         side_lay.addSpacing(8)
         nav = QHBoxLayout()
-        prev_btn = QPushButton("◀ Prev page")
-        prev_btn.clicked.connect(self._prev_page)
-        next_btn = QPushButton("Next page ▶")
-        next_btn.clicked.connect(self._next_page)
-        nav.addWidget(prev_btn)
-        nav.addWidget(next_btn)
+        self.prev_btn = QPushButton("◀ Prev page")
+        self.prev_btn.clicked.connect(self._prev_page)
+        self.next_btn = QPushButton("Next page ▶")
+        self.next_btn.clicked.connect(self._next_page)
+        nav.addWidget(self.prev_btn)
+        nav.addWidget(self.next_btn)
         side_lay.addLayout(nav)
 
-        save_btn = QPushButton("Save template…")
-        save_btn.clicked.connect(self._save)
-        side_lay.addWidget(save_btn)
+        self.save_btn = QPushButton("Save template…")
+        self.save_btn.clicked.connect(self._save)
+        side_lay.addWidget(self.save_btn)
 
         QShortcut(QKeySequence(Qt.Key_Left), self, activated=self._prev_page)
         QShortcut(QKeySequence(Qt.Key_Right), self, activated=self._next_page)
@@ -289,30 +337,172 @@ class TemplateEditor(QMainWindow):
             return
         self._load_pdf(Path(path))
 
+    def _set_busy(self, busy: bool) -> None:
+        """Disable interactive controls while indexing runs on a worker
+        thread so the user can't drive the editor into a half-loaded state."""
+        for w in (self.student_combo, self.prev_btn, self.next_btn,
+                  self.save_btn, self.del_btn):
+            w.setEnabled(not busy)
+
     def _load_pdf(self, path: Path) -> None:
-        self.setWindowTitle(f"Template editor — {path.name}  (indexing…)")
-        QApplication.processEvents()
+        """Kick off incremental QR indexing on a worker thread.
+
+        Rather than decoding every page before letting the user touch the
+        UI, the worker streams: decode page → re-group → emit any newly
+        complete student packets. The editor bootstraps as soon as the
+        first packet is complete (typically ~1-2 s for a 2-page packet
+        scanned in order), and the rest of the students populate the
+        Reference combo as more pages come in. A generation token ignores
+        stale emits if the user opens another PDF mid-index.
+        """
         if self.doc is not None:
             self.doc.close()
-        self.doc = pymupdf.open(path)
-        pages = index_pdf(path, dpi=INDEX_DPI)
-        self.groups = [g for g in group_into_students(pages) if g.student_class != "UNKNOWN"]
-        if not self.groups:
-            QMessageBox.critical(self, "No students found", "Could not decode any QR codes in this PDF.")
+            self.doc = None
+        self.pdf_path = path
+        self._index_token += 1
+        token = self._index_token
+        self.groups = []
+        self.setWindowTitle(f"Template editor — {path.name}  (indexing…)")
+        self._set_busy(True)
+        self.page_label.setText("Indexing pages and decoding QR codes…")
+
+        def work() -> None:
+            try:
+                doc = pymupdf.open(str(path))
+                total = len(doc)
+                raw_pages: list[PageRecord] = []
+                last_sig: tuple = ()
+                for page_num, page in enumerate(doc, start=1):
+                    if token != self._index_token:
+                        doc.close()
+                        return
+                    img = _render_page(page, INDEX_DPI)
+                    text, status = _decode_qr(img)
+                    cls = name = None
+                    pip = tot = None
+                    if text:
+                        parsed = _parse_qr(text)
+                        if parsed:
+                            cls, name, pip, tot = parsed
+                        else:
+                            status = "unknown"
+                    raw_pages.append(PageRecord(
+                        page_num, cls, name, pip, tot, text, status,
+                    ))
+                    # Deep-copy so the grouping pass's _infer_missing
+                    # doesn't poison raw_pages for the next iteration.
+                    snapshot = [dataclasses.replace(r) for r in raw_pages]
+                    grouped = group_into_students(snapshot)
+                    complete = [
+                        g for g in grouped
+                        if g.student_class != "UNKNOWN"
+                        and g.pages
+                        and g.pages[0].pages_total is not None
+                        and len(g.pages) >= g.pages[0].pages_total
+                    ]
+                    sig = tuple(
+                        (g.folder_name, len(g.pages)) for g in complete
+                    )
+                    if sig != last_sig:
+                        last_sig = sig
+                        self._groups_updated.emit(
+                            token, str(path), complete, False,
+                            page_num, total,
+                        )
+                doc.close()
+                # Final emit picks up legacy 2-segment groups (pages_total
+                # was None throughout) that the streaming pass skipped.
+                snapshot = [dataclasses.replace(r) for r in raw_pages]
+                final = [g for g in group_into_students(snapshot)
+                         if g.student_class != "UNKNOWN"]
+                self._groups_updated.emit(
+                    token, str(path), final, True, total, total,
+                )
+            except Exception as e:
+                self._index_failed.emit(token, str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_groups_updated(self, token: int, path_str: str,
+                           groups: list, done: bool,
+                           page_num: int, total: int) -> None:
+        if token != self._index_token:
             return
+        path = Path(path_str)
+        if not self.doc:
+            # Still waiting on the first complete packet. Update the
+            # indexing-progress hint and bootstrap if we got one.
+            if groups:
+                self._bootstrap_editor(path, groups)
+            elif done:
+                self.setWindowTitle(f"Template editor — {path.name}")
+                self.page_label.setText("")
+                self._set_busy(False)
+                QMessageBox.critical(
+                    self, "No students found",
+                    "Could not decode any QR codes in this PDF.",
+                )
+            else:
+                self.page_label.setText(
+                    f"Indexing page {page_num} of {total}…"
+                )
+            return
+        # Editor is already live — merge in any newly complete students
+        # (or legacy 2-segment groups arriving on the final emit) and
+        # update the reference combo without disturbing the user's
+        # current selection.
+        if len(groups) > len(self.groups) or done:
+            current_name = (
+                self.groups[self.current_group_idx].folder_name
+                if self.groups and self.current_group_idx < len(self.groups)
+                else None
+            )
+            self.groups = groups
+            if current_name is not None:
+                for i, g in enumerate(self.groups):
+                    if g.folder_name == current_name:
+                        self.current_group_idx = i
+                        break
+            self._refresh_student_combo()
+        if done:
+            self.setWindowTitle(f"Template editor — {path.name}")
+        else:
+            self.setWindowTitle(
+                f"Template editor — {path.name}  "
+                f"(indexing {page_num}/{total}…)"
+            )
+
+    def _bootstrap_editor(self, path: Path, groups: list) -> None:
+        """First-page-ready handoff: open the rendering doc, render the
+        reference packet, and let the user start drawing rectangles. Runs
+        on the UI thread."""
+        self.groups = groups
+        self.doc = pymupdf.open(str(path))
         self.pdf_path = path
         self.current_group_idx = 0
         self.current_page_idx = 0
         self.regions.clear()
         self.next_q_num = 1
+        self._refresh_student_combo()
+        self._refresh_region_list()
+        self._set_busy(False)
+        self._render_current_page()
+
+    def _refresh_student_combo(self) -> None:
         self.student_combo.blockSignals(True)
         self.student_combo.clear()
         self.student_combo.addItems([g.folder_name for g in self.groups])
-        self.student_combo.setCurrentIndex(0)
+        if 0 <= self.current_group_idx < len(self.groups):
+            self.student_combo.setCurrentIndex(self.current_group_idx)
         self.student_combo.blockSignals(False)
-        self._refresh_region_list()
-        self._render_current_page()
-        self.setWindowTitle(f"Template editor — {path.name}")
+
+    def _on_index_failed(self, token: int, error: str) -> None:
+        if token != self._index_token:
+            return
+        self.setWindowTitle(f"Template editor — {self.pdf_path.name}")
+        self.page_label.setText("")
+        self._set_busy(False)
+        QMessageBox.critical(self, "Indexing failed", error)
 
     # ---------- State accessors ----------
 
