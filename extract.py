@@ -8,13 +8,15 @@ Output layout:
     <output_dir>/<exam>/manifest.csv
     <output_dir>/<exam>/<class>_<firstname>/Q01.png ... QNN.png
 
-When a blank sheet PDF is supplied (--sheet-pdf, or QMARK_SHEET_PATH env var),
-the same template is also applied to the unstamped worksheet to produce
-reference crops under <output>/<exam>/_blank/<Q>.png. Each student crop is
-then compared against its blank reference by ink-density delta, and the
-verdict per (student, question) is written to <output>/<exam>/attempts.csv.
-The marker UI can use attempts.csv to grey out / colour questions that
-were left empty.
+When a blank sheet PDF is supplied (--sheet-pdf, or QMARK_SHEET_PATH env
+var), the same template is applied to the unstamped worksheet to produce
+reference crops under <output>/<exam>/_blank/<Q>.png. Each student crop
+is then compared against its blank reference using an aligned residual-
+ink detector (see _residual_ink_metrics), and the verdict per (student,
+question) is written to <output>/<exam>/attempts.csv along with the
+applied alignment shift. A side-by-side debug PNG for every (student, q)
+lands at <output>/<exam>/_debug/<student>/<q>.png — useful when tuning
+the thresholds or sanity-checking false positives.
 """
 
 from __future__ import annotations
@@ -34,17 +36,55 @@ from scan_index import StudentGroup, group_into_students, index_pdf
 
 EXTRACT_DPI = 300
 
-# Tunable thresholds for attempt detection. The "ink delta" is the fraction
-# of dark pixels in the student crop minus the same in the blank reference.
-# Below DELTA_UNATTEMPTED -> unattempted; below DELTA_BORDERLINE -> borderline
-# (worth a human re-check); else attempted. INK_THRESHOLD is the grayscale
-# value below which a pixel counts as ink — pen on paper sits well below 180
-# after scanning, scan noise stays above it.
-DELTA_UNATTEMPTED = 0.005   # 0.5%
-DELTA_BORDERLINE = 0.020    # 2.0%
-INK_THRESHOLD = 180
+# Pipeline parameters — tune here if scans look systematically different.
+# The detection pipeline (binary subtraction, which cancels printed text):
+#   1. Align the blank crop to the student crop via phase correlation on
+#      grayscale (rich Fourier signal), capped at small shifts.
+#   2. Otsu-binarize both crops: paper -> 0, ink -> 255. This normalises
+#      out the intensity gap between PDF render and scanned print — the
+#      printed worksheet becomes "ink" in BOTH crops and cancels out.
+#   3. Dilate the aligned-blank binary by DILATE_PX so sub-pixel
+#      registration error doesn't leave print-edge halos.
+#   4. `student_ink AND NOT dilated_blank_ink` = ink only the student
+#      added (= handwriting).
+#   5. Morphological open to remove isolated speckle, then two metrics:
+#      - residual_ratio: fraction of crop pixels of student-only ink.
+#      - largest_blob_px: size of the biggest connected component
+#        (separates a real handwriting stroke from scattered noise).
+ALIGNMENT_MAX_SHIFT_PX = 50          # cap big enough to absorb whole-page
+                                     # scan offsets (~15-25 px on this corpus)
+                                     # without taking obvious garbage shifts
+DILATE_KSIZE = 3                     # kernel for dilating aligned blank
+DILATE_ITERATIONS = 2                # ~3-4 px halo around printed text
+EDGE_MARGIN_PX = 6                   # ignore this many pixels from each crop
+                                     # edge — scan edges + page-binding shadows
+                                     # otherwise show up as student-only ink
+LINE_ASPECT_THRESHOLD = 15           # drop connected components whose longer
+                                     # dim is >= 15x the shorter dim — these
+                                     # are box borders / underlines that weren't
+                                     # perfectly cancelled by the dilated blank
+LINE_MIN_LONG_DIM = 60               # only filter when the long dim is at least
+                                     # this many px (so a stray 1x16 spec, which
+                                     # is also high-aspect, doesn't get spared)
+_MORPH_KERNEL = np.ones((2, 2), np.uint8)
+
+# Classification — conservative on unattempted (both metrics must agree),
+# generous on attempted (either metric is enough). Borderline is the
+# overlap zone the marker UI surfaces in amber.
+#
+# Binary subtraction means a truly blank crop should have near-zero
+# residual (only stray scan noise survives speckle removal). Real
+# handwriting forms one or more connected blobs of >=500 px even for a
+# single-digit answer at 300 DPI.
+UNATT_MAX_LARGEST_BLOB = 150         # px (biggest contiguous student-ink blob)
+UNATT_MAX_RESIDUAL_RATIO = 0.0030    # 0.3% of crop pixels (above the ~0.2%
+                                     # noise floor from SC marks + sub-px
+                                     # alignment residue on box borders)
+ATT_MIN_LARGEST_BLOB = 400
+ATT_MIN_RESIDUAL_RATIO = 0.0040      # 0.4%
 
 BLANK_DIR_NAME = "_blank"
+DEBUG_DIR_NAME = "_debug"
 ATTEMPTS_CSV_NAME = "attempts.csv"
 
 
@@ -66,23 +106,201 @@ def crop_region(img: np.ndarray, bbox: list[float]) -> np.ndarray:
     return img[py0:py1, px0:px1]
 
 
-def _ink_ratio(crop: np.ndarray) -> float:
-    """Fraction of pixels darker than INK_THRESHOLD. Size-independent so
-    student/blank crops at the same DPI are directly comparable."""
-    if crop.size == 0:
-        return 0.0
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
-    dark = int(np.count_nonzero(gray < INK_THRESHOLD))
-    return dark / float(gray.size)
+def _align_blank(
+    blank_gray: np.ndarray, student_gray: np.ndarray
+) -> tuple[np.ndarray, float, float]:
+    """Translate the blank crop to best fit the student crop. Returns the
+    aligned blank plus the (dx, dy) that was applied. Falls back to the
+    unaligned input on any phase-correlation failure or on suspiciously-
+    large shifts (which usually mean it locked on to noise, not content)."""
+    h, w = student_gray.shape[:2]
+    if blank_gray.shape[:2] != (h, w):
+        blank_gray = cv2.resize(blank_gray, (w, h))
+    if w < 4 or h < 4:
+        return blank_gray, 0.0, 0.0
+    try:
+        win = cv2.createHanningWindow((w, h), cv2.CV_32F)
+        (dx, dy), _ = cv2.phaseCorrelate(
+            blank_gray.astype(np.float32),
+            student_gray.astype(np.float32),
+            win,
+        )
+    except cv2.error:
+        return blank_gray, 0.0, 0.0
+    if not (np.isfinite(dx) and np.isfinite(dy)):
+        return blank_gray, 0.0, 0.0
+    if abs(dx) > ALIGNMENT_MAX_SHIFT_PX or abs(dy) > ALIGNMENT_MAX_SHIFT_PX:
+        return blank_gray, 0.0, 0.0
+    M = np.array([[1.0, 0.0, dx], [0.0, 1.0, dy]], dtype=np.float32)
+    aligned = cv2.warpAffine(
+        blank_gray, M, (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=255,
+    )
+    return aligned, float(dx), float(dy)
 
 
-def _classify_attempt(student_ratio: float, blank_ratio: float) -> str:
-    delta = student_ratio - blank_ratio
-    if delta < DELTA_UNATTEMPTED:
+def _residual_ink_metrics(
+    blank_crop: np.ndarray, student_crop: np.ndarray
+) -> tuple[float, int, np.ndarray, np.ndarray, np.ndarray, float, float]:
+    """Binary-subtraction residual-ink detection.
+
+    Returns (residual_ratio, largest_blob_px, largest_blob_mask,
+    student_only_ink_mask, aligned_blank_gray, dx, dy).
+
+    The key trick is binarisation: PDF-render and scanned printed text
+    have very different intensities, so a grayscale diff inflates every
+    printed pixel into "added ink". After Otsu-binarising both crops the
+    printed worksheet becomes ink in both — and cancels cleanly against
+    the dilated, aligned blank. Only ink the student added survives.
+    """
+    b_gray = cv2.cvtColor(blank_crop, cv2.COLOR_BGR2GRAY) if blank_crop.ndim == 3 else blank_crop
+    s_gray = cv2.cvtColor(student_crop, cv2.COLOR_BGR2GRAY) if student_crop.ndim == 3 else student_crop
+
+    # Align on grayscale — phase correlation locks onto rich content
+    # better than on binary, where sharp edges produce noisier peaks.
+    aligned_gray, dx, dy = _align_blank(b_gray, s_gray)
+
+    # Otsu-binarise both: paper -> 0, ink -> 255.
+    _, s_bin = cv2.threshold(s_gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    _, ab_bin = cv2.threshold(aligned_gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+
+    # Dilate the aligned blank to forgive 1-2 px sub-pixel misalignment
+    # of printed text edges, so they don't leave halo strokes after XOR.
+    dilate_k = np.ones((DILATE_KSIZE, DILATE_KSIZE), np.uint8)
+    ab_dilated = cv2.dilate(ab_bin, dilate_k, iterations=DILATE_ITERATIONS)
+
+    # Ink in student NOT covered by the dilated aligned blank.
+    diff = cv2.bitwise_and(s_bin, cv2.bitwise_not(ab_dilated))
+
+    # Speckle removal.
+    diff_clean = cv2.morphologyEx(diff, cv2.MORPH_OPEN, _MORPH_KERNEL)
+
+    # Zero out the regions where comparison is meaningless: the strip the
+    # alignment translation filled with border value (the aligned blank
+    # has no real content there) plus a small edge margin (scan edges /
+    # page-binding shadows that exist only in the student crop).
+    h, w = s_gray.shape[:2]
+    valid_mask = np.full((h, w), 255, dtype=np.uint8)
+    if EDGE_MARGIN_PX > 0:
+        valid_mask[:EDGE_MARGIN_PX, :] = 0
+        valid_mask[-EDGE_MARGIN_PX:, :] = 0
+        valid_mask[:, :EDGE_MARGIN_PX] = 0
+        valid_mask[:, -EDGE_MARGIN_PX:] = 0
+    # Alignment-border regions: a positive dx shifts content right, so the
+    # left strip of width dx is fill. Negative dx fills the right strip.
+    pad_l = int(np.ceil(dx)) if dx > 0 else 0
+    pad_r = int(-np.floor(dx)) if dx < 0 else 0
+    pad_t = int(np.ceil(dy)) if dy > 0 else 0
+    pad_b = int(-np.floor(dy)) if dy < 0 else 0
+    if pad_l > 0: valid_mask[:, :pad_l] = 0
+    if pad_r > 0: valid_mask[:, -pad_r:] = 0
+    if pad_t > 0: valid_mask[:pad_t, :] = 0
+    if pad_b > 0: valid_mask[-pad_b:, :] = 0
+    diff_clean = cv2.bitwise_and(diff_clean, valid_mask)
+
+    raw_mask = (diff_clean > 0).astype(np.uint8)
+
+    # Drop connected components shaped like long thin lines — those are
+    # printed box borders / underlines that survive the dilated-blank XOR
+    # because alignment is never perfect at the page edges. Real
+    # handwriting has moderate aspect ratios and gets through.
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        raw_mask, connectivity=8,
+    )
+    student_only_mask = np.zeros_like(raw_mask)
+    for i in range(1, n_labels):
+        cw = int(stats[i, cv2.CC_STAT_WIDTH])
+        ch = int(stats[i, cv2.CC_STAT_HEIGHT])
+        long_dim = max(cw, ch)
+        short_dim = max(1, min(cw, ch))
+        if long_dim >= LINE_MIN_LONG_DIM and (long_dim / short_dim) >= LINE_ASPECT_THRESHOLD:
+            continue
+        student_only_mask[labels == i] = 1
+
+    residual = float(student_only_mask.sum()) / max(1, student_only_mask.size)
+    # Largest blob is now the biggest non-linear component.
+    n_labels2, labels2, stats2, _ = cv2.connectedComponentsWithStats(
+        student_only_mask, connectivity=8,
+    )
+    largest_blob_px = 0
+    largest_blob_mask = np.zeros_like(student_only_mask)
+    if n_labels2 > 1:
+        areas = stats2[1:, cv2.CC_STAT_AREA]
+        biggest_idx = int(np.argmax(areas)) + 1
+        largest_blob_px = int(areas[biggest_idx - 1])
+        largest_blob_mask = (labels2 == biggest_idx).astype(np.uint8)
+    return residual, largest_blob_px, largest_blob_mask, student_only_mask, aligned_gray, dx, dy
+
+
+def _classify_attempt(residual_ratio: float, largest_blob_px: int) -> str:
+    """Two-axis verdict. Unattempted requires BOTH metrics to be quiet —
+    avoids false negatives where a scattered-mark answer doesn't form a
+    big blob but does paint a lot of pixels (and vice versa). Attempted
+    is generous — either signal lighting up is enough."""
+    if (residual_ratio >= ATT_MIN_RESIDUAL_RATIO
+            or largest_blob_px >= ATT_MIN_LARGEST_BLOB):
+        return "attempted"
+    if (residual_ratio < UNATT_MAX_RESIDUAL_RATIO
+            and largest_blob_px < UNATT_MAX_LARGEST_BLOB):
         return "unattempted"
-    if delta < DELTA_BORDERLINE:
-        return "borderline"
-    return "attempted"
+    return "borderline"
+
+
+def _build_debug_image(
+    aligned_blank_gray: np.ndarray,
+    student_crop: np.ndarray,
+    ink_mask_clean: np.ndarray,
+    largest_blob_mask: np.ndarray,
+    status: str,
+    residual: float,
+    largest_blob_px: int,
+    dx: float,
+    dy: float,
+) -> np.ndarray:
+    """Three-panel side-by-side: aligned blank | student | residual overlay.
+
+    Overlay panel: student crop with all detected residual-ink pixels in
+    red, and the LARGEST connected component re-painted in orange on top
+    — so a quick look tells you (a) what the detector counted as ink, and
+    (b) whether the biggest contiguous chunk looks like real handwriting
+    or like a smear of scattered noise.
+
+    Header bar shows verdict, both metrics, and the alignment shift.
+    """
+    if student_crop.ndim == 2:
+        student_show = cv2.cvtColor(student_crop, cv2.COLOR_GRAY2BGR)
+    else:
+        student_show = student_crop
+    blank_show = cv2.cvtColor(aligned_blank_gray, cv2.COLOR_GRAY2BGR)
+    h, w = student_show.shape[:2]
+    if blank_show.shape[:2] != (h, w):
+        blank_show = cv2.resize(blank_show, (w, h))
+
+    overlay = student_show.copy()
+    all_ink = ink_mask_clean.astype(bool)
+    big = largest_blob_mask.astype(bool)
+    overlay[all_ink] = (0, 0, 255)        # red: all residual ink
+    overlay[big]     = (0, 165, 255)      # orange: the largest blob
+
+    sep_w = 6
+    sep = np.full((h, sep_w, 3), 80, dtype=np.uint8)
+    panel = np.hstack([blank_show, sep, student_show, sep, overlay])
+
+    label = (
+        f"{status:>11}  "
+        f"residual={residual*100:6.3f}%  "
+        f"largest_blob={largest_blob_px:>6}px  "
+        f"shift=({dx:+.1f},{dy:+.1f})"
+    )
+    label_h = 28
+    label_bar = np.full((label_h, panel.shape[1], 3), 30, dtype=np.uint8)
+    cv2.putText(
+        label_bar, label, (8, 19), cv2.FONT_HERSHEY_SIMPLEX,
+        0.55, (255, 255, 255), 1, cv2.LINE_AA,
+    )
+    return np.vstack([label_bar, panel])
 
 
 def _render_blank_references(
@@ -91,11 +309,13 @@ def _render_blank_references(
     pages_per_student: int,
     blank_out: Path,
     dpi: int,
-) -> dict[str, float]:
+) -> dict[str, np.ndarray]:
     """Render the unstamped sheet PDF through the template, write each Q's
-    blank crop to <blank_out>/<Q>.png, return ink ratio keyed by question
-    code. Returns empty dict (and logs a warning) when the sheet PDF is
-    missing or shorter than the packet — caller treats absent Qs as unknown.
+    blank crop to <blank_out>/<Q>.png, return the BGR crops keyed by Q
+    code so attempt detection can compare them pixel-for-pixel against
+    student crops. Empty dict (with a warning) when the sheet PDF is
+    missing or shorter than the packet — caller treats absent Qs as
+    unknown.
     """
     if not sheet_pdf.exists():
         print(f"  blank reference: sheet PDF not found at {sheet_pdf}; skipping")
@@ -106,7 +326,7 @@ def _render_blank_references(
         qs_by_page.setdefault(q["page"], []).append(q)
 
     blank_out.mkdir(parents=True, exist_ok=True)
-    ratios: dict[str, float] = {}
+    crops: dict[str, np.ndarray] = {}
 
     doc = pymupdf.open(sheet_pdf)
     try:
@@ -126,12 +346,12 @@ def _render_blank_references(
             for q in qs:
                 crop = crop_region(page_img, q["bbox"])
                 cv2.imwrite(str(blank_out / f"{q['q']}.png"), crop)
-                ratios[q["q"]] = _ink_ratio(crop)
+                crops[q["q"]] = crop
     finally:
         doc.close()
 
-    print(f"  blank reference: wrote {len(ratios)} crop(s) to {blank_out}")
-    return ratios
+    print(f"  blank reference: wrote {len(crops)} crop(s) to {blank_out}")
+    return crops
 
 
 def extract(
@@ -166,11 +386,16 @@ def extract(
     exam_out = output_dir / exam_name
     exam_out.mkdir(parents=True, exist_ok=True)
 
-    blank_ratios: dict[str, float] = {}
+    blank_crops: dict[str, np.ndarray] = {}
     if sheet_pdf is not None:
-        blank_ratios = _render_blank_references(
+        blank_crops = _render_blank_references(
             sheet_pdf, questions, pages_per_student, exam_out / BLANK_DIR_NAME, dpi,
         )
+
+    debug_root: Path | None = None
+    if blank_crops:
+        debug_root = exam_out / DEBUG_DIR_NAME
+        debug_root.mkdir(parents=True, exist_ok=True)
 
     doc = pymupdf.open(pdf_path)
 
@@ -180,7 +405,8 @@ def extract(
     for group in groups:
         row, student_attempts = _extract_one_student(
             doc, group, qs_by_page, exam_out, pages_per_student, dpi,
-            blank_ratios=blank_ratios,
+            blank_crops=blank_crops,
+            debug_root=debug_root,
         )
         manifest_rows.append(row)
         attempts_rows.extend(student_attempts)
@@ -199,19 +425,11 @@ def extract(
         writer.writeheader()
         writer.writerows(manifest_rows)
 
-    if blank_ratios:
+    if blank_crops:
         attempts_path = exam_out / ATTEMPTS_CSV_NAME
-        with attempts_path.open("w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=[
-                "student_folder", "q", "status",
-                "blank_ink_ratio", "student_ink_ratio", "delta",
-            ])
-            writer.writeheader()
-            writer.writerows(attempts_rows)
-        n_unatt = sum(1 for r in attempts_rows if r["status"] == "unattempted")
-        n_bord = sum(1 for r in attempts_rows if r["status"] == "borderline")
-        print(f"\nAttempt detection: {len(attempts_rows)} crops scored — "
-              f"{n_unatt} unattempted, {n_bord} borderline. Written to {attempts_path}")
+        _write_attempts_csv(attempts_path, attempts_rows)
+        if debug_root is not None:
+            print(f"Debug images:    {debug_root}")
 
     print(f"\nDone. Output: {exam_out}")
     print(f"Manifest:    {manifest_path}")
@@ -224,7 +442,8 @@ def _extract_one_student(
     exam_out: Path,
     pages_per_student: int,
     dpi: int,
-    blank_ratios: dict[str, float] | None = None,
+    blank_crops: dict[str, np.ndarray] | None = None,
+    debug_root: Path | None = None,
 ) -> tuple[dict, list[dict]]:
     base_row = {
         "student_class": group.student_class,
@@ -241,8 +460,11 @@ def _extract_one_student(
 
     student_dir = exam_out / group.folder_name
     student_dir.mkdir(parents=True, exist_ok=True)
+    debug_dir = (debug_root / group.folder_name) if debug_root is not None else None
+    if debug_dir is not None:
+        debug_dir.mkdir(parents=True, exist_ok=True)
 
-    blank_ratios = blank_ratios or {}
+    blank_crops = blank_crops or {}
     n_extracted = 0
     attempts: list[dict] = []
     for packet_page_idx in range(1, pages_per_student + 1):
@@ -255,35 +477,149 @@ def _extract_one_student(
             crop = crop_region(page_img, q["bbox"])
             cv2.imwrite(str(student_dir / f"{q['q']}.png"), crop)
             n_extracted += 1
-            if not blank_ratios:
+            if not blank_crops:
                 continue
             q_code = q["q"]
-            if q_code not in blank_ratios:
+            blank_crop = blank_crops.get(q_code)
+            if blank_crop is None:
                 attempts.append({
                     "student_folder": group.folder_name, "q": q_code,
                     "status": "unknown",
-                    "blank_ink_ratio": "", "student_ink_ratio": "", "delta": "",
+                    "residual_ratio": "", "alignment_dx": "", "alignment_dy": "",
                 })
                 continue
-            student_r = _ink_ratio(crop)
-            blank_r = blank_ratios[q_code]
+            (residual, largest_blob_px, largest_mask, ink_mask,
+             aligned_blank, dx, dy) = _residual_ink_metrics(blank_crop, crop)
+            status = _classify_attempt(residual, largest_blob_px)
             attempts.append({
                 "student_folder": group.folder_name, "q": q_code,
-                "status": _classify_attempt(student_r, blank_r),
-                "blank_ink_ratio": f"{blank_r:.4f}",
-                "student_ink_ratio": f"{student_r:.4f}",
-                "delta": f"{student_r - blank_r:+.4f}",
+                "status": status,
+                "residual_ratio": f"{residual:.5f}",
+                "largest_blob_px": str(largest_blob_px),
+                "alignment_dx": f"{dx:+.2f}",
+                "alignment_dy": f"{dy:+.2f}",
             })
+            if debug_dir is not None:
+                debug_img = _build_debug_image(
+                    aligned_blank, crop, ink_mask, largest_mask,
+                    status, residual, largest_blob_px, dx, dy,
+                )
+                cv2.imwrite(str(debug_dir / f"{q_code}.png"), debug_img)
 
     base_row["n_questions_extracted"] = n_extracted
     return base_row, attempts
 
 
+def _write_attempts_csv(attempts_path: Path, rows: list[dict]) -> None:
+    with attempts_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "student_folder", "q", "status",
+            "residual_ratio", "largest_blob_px",
+            "alignment_dx", "alignment_dy",
+        ])
+        writer.writeheader()
+        writer.writerows(rows)
+    n_att = sum(1 for r in rows if r["status"] == "attempted")
+    n_bord = sum(1 for r in rows if r["status"] == "borderline")
+    n_unatt = sum(1 for r in rows if r["status"] == "unattempted")
+    print(
+        f"\nAttempt detection: {len(rows)} crops scored — "
+        f"{n_att} attempted, {n_bord} borderline, {n_unatt} unattempted. "
+        f"Written to {attempts_path}"
+    )
+
+
+def rescore(exam_dir: Path) -> None:
+    """Re-run attempt detection against existing crops on disk.
+
+    Reuses <exam>/_blank/ and the per-student folders that the previous
+    extract run left behind, recomputes attempts.csv with the current
+    classifier parameters, and refreshes <exam>/_debug/ images. Lets you
+    iterate on thresholds in seconds instead of re-rendering the scan PDF.
+    """
+    if not exam_dir.is_dir():
+        sys.exit(f"Exam directory not found: {exam_dir}")
+    blank_dir = exam_dir / BLANK_DIR_NAME
+    if not blank_dir.is_dir():
+        sys.exit(f"No {BLANK_DIR_NAME}/ folder at {blank_dir} — nothing to rescore.")
+
+    blank_crops: dict[str, np.ndarray] = {}
+    for fname in sorted(os.listdir(blank_dir)):
+        if not fname.lower().endswith(".png"):
+            continue
+        q_code = os.path.splitext(fname)[0]
+        img = cv2.imread(str(blank_dir / fname))
+        if img is not None:
+            blank_crops[q_code] = img
+    if not blank_crops:
+        sys.exit(f"No blank crops found in {blank_dir}.")
+    print(f"Loaded {len(blank_crops)} blank reference crops from {blank_dir}.")
+
+    debug_root = exam_dir / DEBUG_DIR_NAME
+    debug_root.mkdir(parents=True, exist_ok=True)
+
+    attempts_rows: list[dict] = []
+    student_count = 0
+    for entry in sorted(os.listdir(exam_dir)):
+        student_dir = exam_dir / entry
+        if not student_dir.is_dir() or entry.startswith("_"):
+            continue
+        debug_dir = debug_root / entry
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        scored_this_student = 0
+        for fname in sorted(os.listdir(student_dir)):
+            if not fname.lower().endswith(".png"):
+                continue
+            q_code = os.path.splitext(fname)[0]
+            blank_crop = blank_crops.get(q_code)
+            if blank_crop is None:
+                continue
+            student_crop = cv2.imread(str(student_dir / fname))
+            if student_crop is None:
+                continue
+            (residual, largest_blob_px, largest_mask, ink_mask,
+             aligned_blank, dx, dy) = _residual_ink_metrics(blank_crop, student_crop)
+            status = _classify_attempt(residual, largest_blob_px)
+            attempts_rows.append({
+                "student_folder": entry, "q": q_code,
+                "status": status,
+                "residual_ratio": f"{residual:.5f}",
+                "largest_blob_px": str(largest_blob_px),
+                "alignment_dx": f"{dx:+.2f}",
+                "alignment_dy": f"{dy:+.2f}",
+            })
+            debug_img = _build_debug_image(
+                aligned_blank, student_crop, ink_mask, largest_mask,
+                status, residual, largest_blob_px, dx, dy,
+            )
+            cv2.imwrite(str(debug_dir / f"{q_code}.png"), debug_img)
+            scored_this_student += 1
+        if scored_this_student:
+            student_count += 1
+            print(f"  scored {scored_this_student:>3} crops for {entry}")
+
+    print(f"\n{student_count} students processed.")
+    _write_attempts_csv(exam_dir / ATTEMPTS_CSV_NAME, attempts_rows)
+    print(f"Debug images:    {debug_root}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Extract per-question crops from a scan PDF.")
-    parser.add_argument("pdf", type=Path, help="Path to the scan PDF")
-    parser.add_argument("template", type=Path, help="Path to the template YAML")
-    parser.add_argument("output", type=Path, help="Output directory")
+    parser.add_argument(
+        "--rescore",
+        type=Path,
+        default=None,
+        metavar="EXAM_DIR",
+        help=(
+            "Skip extraction and re-run attempt detection against the crops "
+            "already on disk under EXAM_DIR (which must contain _blank/ and "
+            "per-student folders). Refreshes attempts.csv and _debug/ images "
+            "without touching the scan PDF — fast loop for tuning thresholds."
+        ),
+    )
+    parser.add_argument("pdf", type=Path, nargs="?", help="Path to the scan PDF")
+    parser.add_argument("template", type=Path, nargs="?", help="Path to the template YAML")
+    parser.add_argument("output", type=Path, nargs="?", help="Output directory")
     parser.add_argument("--dpi", type=int, default=EXTRACT_DPI, help=f"Render DPI (default {EXTRACT_DPI})")
     parser.add_argument(
         "--exam-name",
@@ -296,13 +632,21 @@ def main() -> None:
         default=None,
         help=(
             "Blank worksheet PDF — when supplied, the same template is applied "
-            "to it to produce reference crops under <output>/<exam>/_blank/ and "
-            "an attempts.csv classifying each student crop as attempted, "
-            "unattempted, or borderline. Defaults to env QMARK_SHEET_PATH."
+            "to it to produce reference crops under <output>/<exam>/_blank/, an "
+            "attempts.csv classifying each student crop as attempted, "
+            "unattempted, or borderline (aligned residual-ink detector), and a "
+            "side-by-side debug PNG per (student, q) under "
+            "<output>/<exam>/_debug/. Defaults to env QMARK_SHEET_PATH."
         ),
     )
     args = parser.parse_args()
 
+    if args.rescore is not None:
+        rescore(args.rescore)
+        return
+
+    if args.pdf is None or args.template is None or args.output is None:
+        parser.error("pdf, template, and output are required (omit only with --rescore)")
     if not args.pdf.exists():
         sys.exit(f"PDF not found: {args.pdf}")
     if not args.template.exists():

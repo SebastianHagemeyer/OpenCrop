@@ -64,13 +64,36 @@ Conventions:
 When the dashboard launches OpenCrop it sets `QMARK_SHEET_PATH` to the unstamped worksheet PDF; the same value can be passed on the CLI as `--sheet-pdf`. When present, `extract.py` renders that blank sheet through the *same template* and writes:
 
 - **`_blank/Q01.png … QNN.png`** — reference "empty" crops, useful for diffs in the marker UI and as a visual baseline.
-- **`attempts.csv`** with columns `student_folder, q, status, blank_ink_ratio, student_ink_ratio, delta`. `status` is one of:
-  - `attempted` — the student's crop has substantially more ink than the blank (delta ≥ 2%).
-  - `borderline` — small but non-zero increase (0.5–2%); worth a human re-check.
-  - `unattempted` — delta < 0.5%; the marker UI can default the score to 0 and grey out the question. Click-through should still let the teacher override.
-  - `unknown` — no blank reference available for this Q (sheet PDF had fewer pages than the packet, etc).
+- **`attempts.csv`** with columns `student_folder, q, status, residual_ratio, largest_blob_px, alignment_dx, alignment_dy`. `status` is one of:
+  - `attempted` — either metric clearly above the floor (residual ≥ 3% **or** largest blob ≥ 5500 px). One signal is enough.
+  - `borderline` — small but non-zero residual; worth a human re-check.
+  - `unattempted` — both metrics quiet (residual < 2% **and** largest blob < 3000 px); the marker UI greys out and the teacher can score 0 with Ctrl+0.
+  - `unknown` — no blank reference for this Q (sheet PDF was shorter than the packet, etc).
+- **`_debug/<student>/<q>.png`** — a three-panel side-by-side: aligned blank | student | residual overlay. Detected ink is painted red; the *largest connected component* (the one that drives the blob metric) is painted orange on top. A header strip shows the verdict, both metrics, and the alignment shift. Open these in any image viewer to spot-check false positives/negatives.
 
-The detector uses a fixed grayscale threshold (`INK_THRESHOLD = 180`) and compares dark-pixel ratios rather than per-pixel subtraction, so it's robust to small scan skew/translation without needing alignment. Thresholds live at the top of `extract.py` (`DELTA_UNATTEMPTED`, `DELTA_BORDERLINE`) — tune there if false positives/negatives become a problem in real use.
+### The detector pipeline
+
+1. **Phase-correlation alignment** translates the blank crop to best fit the student crop (capped at ±20 px to avoid locking onto noise on a feature-poor crop).
+2. **Gaussian blur** (3×3, σ=0.8) of both crops absorbs sub-pixel registration error and PDF-vs-scan anti-aliasing differences.
+3. **Intensity diff** `max(blank − student, 0)` — how much darker each pixel got. Scan paper-darkening (~10–20 grayscale units) stays under the cutoff; pen strokes (100+ units darker) survive.
+4. **Threshold** at `INK_DIFF_THRESHOLD = 60` grayscale units, then **morphological open** with a 2×2 kernel kills isolated speckle noise.
+5. Two metrics fall out of the cleaned mask:
+   - `residual_ratio` = fraction of crop pixels still marked as added ink. Picks up scattered-mark answers (ticks, asterisks) that don't form a big blob.
+   - `largest_blob_px` = size of the biggest connected component. Picks up contiguous handwriting strokes; print-edge noise stays in many tiny blobs.
+
+Tunable parameters live at the top of `extract.py`: pipeline ones (`ALIGNMENT_MAX_SHIFT_PX`, `BLUR_KSIZE`, `BLUR_SIGMA`, `INK_DIFF_THRESHOLD`) and band cutoffs (`UNATT_MAX_*`, `ATT_MIN_*`). The cutoffs assume a 300 DPI scan of a single-column maths worksheet — denser sheets (graph paper, dense formulas) raise the noise floor and need higher cutoffs.
+
+### Iterating on thresholds without re-extracting
+
+Re-rendering the scan PDF takes minutes per exam. Once you have student crops and `_blank/` on disk, use:
+
+```
+python extract.py --rescore <exam_dir>
+```
+
+It loads existing crops, re-runs only the comparison step, and rewrites `attempts.csv` + `_debug/` images in seconds. Drop in new threshold values, rescore, eyeball the debug images, repeat.
+
+### Marker UI fallback
 
 When `attempts.csv` is missing, the marker should fall back to "all unknown" — i.e. treat every question as attempted by default and skip the greying behaviour.
 
@@ -116,8 +139,11 @@ python make_template.py workScans\10MATD_combinedTEST.pdf
 # Extract per-question crops to disk (optional — see "on-the-fly" below)
 python extract.py workScans\10MATD_combinedTEST.pdf 10MATD_combinedTEST.yaml output\
 # Custom DPI: --dpi 400
-# With attempt detection (writes _blank/ + attempts.csv):
+# With attempt detection (writes _blank/, attempts.csv, _debug/):
 python extract.py workScans\10MATD_combinedTEST.pdf 10MATD_combinedTEST.yaml output\ --sheet-pdf Sheets\10MATD_combinedTEST.pdf
+
+# Re-run JUST the attempt detection on existing crops (fast threshold-tuning loop):
+python extract.py --rescore output\10MATD_combinedTEST
 ```
 
 ## On-the-fly crop access (preferred for the marker)
