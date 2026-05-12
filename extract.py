@@ -66,6 +66,17 @@ LINE_ASPECT_THRESHOLD = 15           # drop connected components whose longer
 LINE_MIN_LONG_DIM = 60               # only filter when the long dim is at least
                                      # this many px (so a stray 1x16 spec, which
                                      # is also high-aspect, doesn't get spared)
+CLUSTER_DILATE_PX = 5                # dilate the surviving ink by this many px
+                                     # before grouping into clusters — merges
+                                     # adjacent digits/strokes of one answer
+                                     # into a single connected component
+# Colored-ink detection. PEN ink (blue, red, green, etc.) is saturated;
+# printed text is essentially black (very low saturation). Pixels with
+# noticeable saturation and dark-ish value are almost certainly pen ink
+# and provide a clean override signal when present.
+COLOR_SAT_MIN = 40                   # HSV saturation (0-255) above this = colored
+COLOR_VAL_MIN = 30                   # avoid near-black noise / bleed-through
+COLOR_VAL_MAX = 220                  # avoid faint paper texture
 _MORPH_KERNEL = np.ones((2, 2), np.uint8)
 
 # Classification — conservative on unattempted (both metrics must agree),
@@ -76,12 +87,19 @@ _MORPH_KERNEL = np.ones((2, 2), np.uint8)
 # residual (only stray scan noise survives speckle removal). Real
 # handwriting forms one or more connected blobs of >=500 px even for a
 # single-digit answer at 300 DPI.
-UNATT_MAX_LARGEST_BLOB = 150         # px (biggest contiguous student-ink blob)
-UNATT_MAX_RESIDUAL_RATIO = 0.0030    # 0.3% of crop pixels (above the ~0.2%
+UNATT_MAX_LARGEST_BLOB = 550         # px (raw ink within the densest cluster
+                                     # — adjacent digits of one answer get
+                                     # grouped via CLUSTER_DILATE_PX merging)
+UNATT_MAX_RESIDUAL_RATIO = 0.0025    # 0.25% of crop pixels (above the ~0.2%
                                      # noise floor from SC marks + sub-px
                                      # alignment residue on box borders)
-ATT_MIN_LARGEST_BLOB = 400
+UNATT_MAX_COLOR_INK_PX = 150         # negligible coloured pixels (blank scans
+                                     # cap at ~150 from JPEG colour ringing
+                                     # near printed black text)
+ATT_MIN_LARGEST_BLOB = 800
 ATT_MIN_RESIDUAL_RATIO = 0.0040      # 0.4%
+ATT_MIN_COLOR_INK_PX = 200           # any cluster of coloured pen ink above
+                                     # this is almost certainly real writing
 
 BLANK_DIR_NAME = "_blank"
 DEBUG_DIR_NAME = "_debug"
@@ -141,19 +159,45 @@ def _align_blank(
     return aligned, float(dx), float(dy)
 
 
+def _color_ink_pixels(student_crop_bgr: np.ndarray) -> tuple[int, np.ndarray]:
+    """Detect coloured pen ink — saturated pixels with dark-ish value.
+
+    Printed text is essentially black (very low saturation), so this
+    signal cleanly separates blue/red/green pen writing from any
+    print-cancellation residue. A clean override when the student wrote
+    in colour (most teenagers do). Returns (count, binary_mask).
+    """
+    if student_crop_bgr.ndim != 3:
+        return 0, np.zeros(student_crop_bgr.shape[:2], dtype=np.uint8)
+    hsv = cv2.cvtColor(student_crop_bgr, cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+    mask = ((sat > COLOR_SAT_MIN)
+            & (val < COLOR_VAL_MAX)
+            & (val > COLOR_VAL_MIN)).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _MORPH_KERNEL)
+    return int(mask.sum()), mask
+
+
 def _residual_ink_metrics(
     blank_crop: np.ndarray, student_crop: np.ndarray
-) -> tuple[float, int, np.ndarray, np.ndarray, np.ndarray, float, float]:
-    """Binary-subtraction residual-ink detection.
+) -> tuple[float, int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
+    """Binary-subtraction residual-ink + colour-ink detection.
 
-    Returns (residual_ratio, largest_blob_px, largest_blob_mask,
-    student_only_ink_mask, aligned_blank_gray, dx, dy).
+    Returns (residual_ratio, largest_blob_px, color_ink_px,
+    largest_blob_mask, student_only_mask, color_mask,
+    aligned_blank_gray, dx, dy).
 
-    The key trick is binarisation: PDF-render and scanned printed text
-    have very different intensities, so a grayscale diff inflates every
-    printed pixel into "added ink". After Otsu-binarising both crops the
-    printed worksheet becomes ink in both — and cancels cleanly against
-    the dilated, aligned blank. Only ink the student added survives.
+    The key trick for residual_ratio is binarisation: PDF-render and
+    scanned printed text have very different intensities, so a grayscale
+    diff inflates every printed pixel into "added ink". After Otsu-
+    binarising both crops the printed worksheet becomes ink in both —
+    and cancels cleanly against the dilated, aligned blank. Only ink
+    the student added survives.
+
+    `color_ink_px` is a complementary high-confidence signal — coloured
+    pen ink that simply cannot be the printed worksheet, regardless of
+    alignment quality.
     """
     b_gray = cv2.cvtColor(blank_crop, cv2.COLOR_BGR2GRAY) if blank_crop.ndim == 3 else blank_crop
     s_gray = cv2.cvtColor(student_crop, cv2.COLOR_BGR2GRAY) if student_crop.ndim == 3 else student_crop
@@ -220,30 +264,48 @@ def _residual_ink_metrics(
         student_only_mask[labels == i] = 1
 
     residual = float(student_only_mask.sum()) / max(1, student_only_mask.size)
-    # Largest blob is now the biggest non-linear component.
-    n_labels2, labels2, stats2, _ = cv2.connectedComponentsWithStats(
-        student_only_mask, connectivity=8,
+    # Cluster nearby ink: dilate so adjacent digits/strokes of one answer
+    # merge into a single connected component (each digit on its own is
+    # too small to clear the threshold). Then for each cluster count how
+    # many *raw* ink pixels fall inside it. The largest "ink-in-cluster"
+    # is the signal — distinguishes a dense answer like "250" from
+    # scattered SC-mark noise where each spec sits in its own cluster.
+    cluster_kernel = np.ones(
+        (CLUSTER_DILATE_PX * 2 + 1, CLUSTER_DILATE_PX * 2 + 1), np.uint8,
+    )
+    clustered = cv2.dilate(student_only_mask, cluster_kernel)
+    n_labels2, labels2, _, _ = cv2.connectedComponentsWithStats(
+        clustered, connectivity=8,
     )
     largest_blob_px = 0
     largest_blob_mask = np.zeros_like(student_only_mask)
-    if n_labels2 > 1:
-        areas = stats2[1:, cv2.CC_STAT_AREA]
-        biggest_idx = int(np.argmax(areas)) + 1
-        largest_blob_px = int(areas[biggest_idx - 1])
-        largest_blob_mask = (labels2 == biggest_idx).astype(np.uint8)
-    return residual, largest_blob_px, largest_blob_mask, student_only_mask, aligned_gray, dx, dy
+    for i in range(1, n_labels2):
+        cluster_pixels = (labels2 == i).astype(np.uint8)
+        ink_in_cluster = int((student_only_mask & cluster_pixels).sum())
+        if ink_in_cluster > largest_blob_px:
+            largest_blob_px = ink_in_cluster
+            largest_blob_mask = (student_only_mask & cluster_pixels)
+
+    color_ink_px, color_mask = _color_ink_pixels(student_crop)
+    return (residual, largest_blob_px, color_ink_px,
+            largest_blob_mask, student_only_mask, color_mask,
+            aligned_gray, dx, dy)
 
 
-def _classify_attempt(residual_ratio: float, largest_blob_px: int) -> str:
-    """Two-axis verdict. Unattempted requires BOTH metrics to be quiet —
-    avoids false negatives where a scattered-mark answer doesn't form a
-    big blob but does paint a lot of pixels (and vice versa). Attempted
-    is generous — either signal lighting up is enough."""
+def _classify_attempt(residual_ratio: float, largest_blob_px: int, color_ink_px: int) -> str:
+    """Three-signal verdict. Coloured pen ink is the strongest signal — if
+    present in any meaningful amount, the student wrote. Otherwise fall
+    back to the binary-subtraction signals: either substantial residual
+    OR a big ink cluster is enough for attempted; unattempted needs all
+    three signals quiet."""
+    if color_ink_px >= ATT_MIN_COLOR_INK_PX:
+        return "attempted"
     if (residual_ratio >= ATT_MIN_RESIDUAL_RATIO
             or largest_blob_px >= ATT_MIN_LARGEST_BLOB):
         return "attempted"
     if (residual_ratio < UNATT_MAX_RESIDUAL_RATIO
-            and largest_blob_px < UNATT_MAX_LARGEST_BLOB):
+            and largest_blob_px < UNATT_MAX_LARGEST_BLOB
+            and color_ink_px < UNATT_MAX_COLOR_INK_PX):
         return "unattempted"
     return "borderline"
 
@@ -253,9 +315,11 @@ def _build_debug_image(
     student_crop: np.ndarray,
     ink_mask_clean: np.ndarray,
     largest_blob_mask: np.ndarray,
+    color_mask: np.ndarray,
     status: str,
     residual: float,
     largest_blob_px: int,
+    color_ink_px: int,
     dx: float,
     dy: float,
 ) -> np.ndarray:
@@ -279,10 +343,12 @@ def _build_debug_image(
         blank_show = cv2.resize(blank_show, (w, h))
 
     overlay = student_show.copy()
+    color_b = color_mask.astype(bool)
     all_ink = ink_mask_clean.astype(bool)
     big = largest_blob_mask.astype(bool)
-    overlay[all_ink] = (0, 0, 255)        # red: all residual ink
-    overlay[big]     = (0, 165, 255)      # orange: the largest blob
+    overlay[all_ink] = (0, 0, 255)        # red: all binary-residual ink
+    overlay[big]     = (0, 165, 255)      # orange: largest cluster
+    overlay[color_b] = (255, 0, 255)      # magenta: coloured-pen pixels
 
     sep_w = 6
     sep = np.full((h, sep_w, 3), 80, dtype=np.uint8)
@@ -291,7 +357,8 @@ def _build_debug_image(
     label = (
         f"{status:>11}  "
         f"residual={residual*100:6.3f}%  "
-        f"largest_blob={largest_blob_px:>6}px  "
+        f"cluster_ink={largest_blob_px:>5}px  "
+        f"color_ink={color_ink_px:>5}px  "
         f"shift=({dx:+.1f},{dy:+.1f})"
     )
     label_h = 28
@@ -488,21 +555,23 @@ def _extract_one_student(
                     "residual_ratio": "", "alignment_dx": "", "alignment_dy": "",
                 })
                 continue
-            (residual, largest_blob_px, largest_mask, ink_mask,
+            (residual, largest_blob_px, color_ink_px,
+             largest_mask, ink_mask, color_mask,
              aligned_blank, dx, dy) = _residual_ink_metrics(blank_crop, crop)
-            status = _classify_attempt(residual, largest_blob_px)
+            status = _classify_attempt(residual, largest_blob_px, color_ink_px)
             attempts.append({
                 "student_folder": group.folder_name, "q": q_code,
                 "status": status,
                 "residual_ratio": f"{residual:.5f}",
                 "largest_blob_px": str(largest_blob_px),
+                "color_ink_px": str(color_ink_px),
                 "alignment_dx": f"{dx:+.2f}",
                 "alignment_dy": f"{dy:+.2f}",
             })
             if debug_dir is not None:
                 debug_img = _build_debug_image(
-                    aligned_blank, crop, ink_mask, largest_mask,
-                    status, residual, largest_blob_px, dx, dy,
+                    aligned_blank, crop, ink_mask, largest_mask, color_mask,
+                    status, residual, largest_blob_px, color_ink_px, dx, dy,
                 )
                 cv2.imwrite(str(debug_dir / f"{q_code}.png"), debug_img)
 
@@ -514,7 +583,7 @@ def _write_attempts_csv(attempts_path: Path, rows: list[dict]) -> None:
     with attempts_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=[
             "student_folder", "q", "status",
-            "residual_ratio", "largest_blob_px",
+            "residual_ratio", "largest_blob_px", "color_ink_px",
             "alignment_dx", "alignment_dy",
         ])
         writer.writeheader()
@@ -577,20 +646,22 @@ def rescore(exam_dir: Path) -> None:
             student_crop = cv2.imread(str(student_dir / fname))
             if student_crop is None:
                 continue
-            (residual, largest_blob_px, largest_mask, ink_mask,
+            (residual, largest_blob_px, color_ink_px,
+             largest_mask, ink_mask, color_mask,
              aligned_blank, dx, dy) = _residual_ink_metrics(blank_crop, student_crop)
-            status = _classify_attempt(residual, largest_blob_px)
+            status = _classify_attempt(residual, largest_blob_px, color_ink_px)
             attempts_rows.append({
                 "student_folder": entry, "q": q_code,
                 "status": status,
                 "residual_ratio": f"{residual:.5f}",
                 "largest_blob_px": str(largest_blob_px),
+                "color_ink_px": str(color_ink_px),
                 "alignment_dx": f"{dx:+.2f}",
                 "alignment_dy": f"{dy:+.2f}",
             })
             debug_img = _build_debug_image(
-                aligned_blank, student_crop, ink_mask, largest_mask,
-                status, residual, largest_blob_px, dx, dy,
+                aligned_blank, student_crop, ink_mask, largest_mask, color_mask,
+                status, residual, largest_blob_px, color_ink_px, dx, dy,
             )
             cv2.imwrite(str(debug_dir / f"{q_code}.png"), debug_img)
             scored_this_student += 1
