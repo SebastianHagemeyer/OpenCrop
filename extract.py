@@ -54,6 +54,10 @@ EXTRACT_DPI = 300
 ALIGNMENT_MAX_SHIFT_PX = 50          # cap big enough to absorb whole-page
                                      # scan offsets (~15-25 px on this corpus)
                                      # without taking obvious garbage shifts
+CLAHE_CLIP_LIMIT = 3.0               # contrast-limited adaptive histogram eq
+CLAHE_TILE = (16, 16)                # — boosts pencil contrast for detection
+ADAPTIVE_BLOCK_SIZE = 51             # adaptive-threshold neighbourhood (px)
+ADAPTIVE_C = 12                      # subtract from local mean for ink cutoff
 DILATE_KSIZE = 3                     # kernel for dilating aligned blank
 DILATE_ITERATIONS = 2                # ~3-4 px halo around printed text
 EDGE_MARGIN_PX = 6                   # ignore this many pixels from each crop
@@ -87,12 +91,12 @@ _MORPH_KERNEL = np.ones((2, 2), np.uint8)
 # residual (only stray scan noise survives speckle removal). Real
 # handwriting forms one or more connected blobs of >=500 px even for a
 # single-digit answer at 300 DPI.
-UNATT_MAX_LARGEST_BLOB = 550         # px (raw ink within the densest cluster
+UNATT_MAX_LARGEST_BLOB = 600         # px (raw ink within the densest cluster
                                      # — adjacent digits of one answer get
                                      # grouped via CLUSTER_DILATE_PX merging)
-UNATT_MAX_RESIDUAL_RATIO = 0.0025    # 0.25% of crop pixels (above the ~0.2%
-                                     # noise floor from SC marks + sub-px
-                                     # alignment residue on box borders)
+UNATT_MAX_RESIDUAL_RATIO = 0.0035    # 0.35% of crop pixels (CLAHE + adaptive
+                                     # thresholding bumps the noise floor a
+                                     # bit; pencil detection makes up for it)
 UNATT_MAX_COLOR_INK_PX = 150         # negligible coloured pixels (blank scans
                                      # cap at ~150 from JPEG colour ringing
                                      # near printed black text)
@@ -103,6 +107,7 @@ ATT_MIN_COLOR_INK_PX = 200           # any cluster of coloured pen ink above
 
 BLANK_DIR_NAME = "_blank"
 DEBUG_DIR_NAME = "_debug"
+ENHANCED_DIR_NAME = "_enhanced"
 ATTEMPTS_CSV_NAME = "attempts.csv"
 
 
@@ -159,6 +164,27 @@ def _align_blank(
     return aligned, float(dx), float(dy)
 
 
+def _clahe_gray(gray: np.ndarray) -> np.ndarray:
+    """CLAHE-boost a grayscale image — stretches local contrast so pencil
+    marks (~150-180 grayscale) become darker relative to paper (~230)
+    without amplifying noise the way a global histogram stretch would."""
+    clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE)
+    return clahe.apply(gray)
+
+
+def _enhance_for_display(bgr: np.ndarray) -> np.ndarray:
+    """Colour-preserving CLAHE for the marker UI. Boosts the L channel in
+    LAB space so faint pencil writing pops on screen, leaves hue/saturation
+    alone so coloured pen ink still looks correct."""
+    if bgr.ndim != 3:
+        return bgr
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    L, A, B = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=CLAHE_TILE)
+    L_enh = clahe.apply(L)
+    return cv2.cvtColor(cv2.merge([L_enh, A, B]), cv2.COLOR_LAB2BGR)
+
+
 def _color_ink_pixels(student_crop_bgr: np.ndarray) -> tuple[int, np.ndarray]:
     """Detect coloured pen ink — saturated pixels with dark-ish value.
 
@@ -202,13 +228,27 @@ def _residual_ink_metrics(
     b_gray = cv2.cvtColor(blank_crop, cv2.COLOR_BGR2GRAY) if blank_crop.ndim == 3 else blank_crop
     s_gray = cv2.cvtColor(student_crop, cv2.COLOR_BGR2GRAY) if student_crop.ndim == 3 else student_crop
 
+    # Boost local contrast — faint pencil marks (~150-180 grayscale) need
+    # this to clear the binarisation threshold; printed text and pen ink
+    # are unaffected because they're already deep in the dark range.
+    b_gray = _clahe_gray(b_gray)
+    s_gray = _clahe_gray(s_gray)
+
     # Align on grayscale — phase correlation locks onto rich content
     # better than on binary, where sharp edges produce noisier peaks.
     aligned_gray, dx, dy = _align_blank(b_gray, s_gray)
 
-    # Otsu-binarise both: paper -> 0, ink -> 255.
-    _, s_bin = cv2.threshold(s_gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
-    _, ab_bin = cv2.threshold(aligned_gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    # Adaptive thresholding: pixel is ink if it's darker than its local
+    # neighbourhood mean by `ADAPTIVE_C` — handles varying paper darkness
+    # and faint marks better than Otsu's single global threshold.
+    s_bin = cv2.adaptiveThreshold(
+        s_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, ADAPTIVE_BLOCK_SIZE, ADAPTIVE_C,
+    )
+    ab_bin = cv2.adaptiveThreshold(
+        aligned_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, ADAPTIVE_BLOCK_SIZE, ADAPTIVE_C,
+    )
 
     # Dilate the aligned blank to forgive 1-2 px sub-pixel misalignment
     # of printed text edges, so they don't leave halo strokes after XOR.
@@ -460,9 +500,15 @@ def extract(
         )
 
     debug_root: Path | None = None
+    enhanced_root: Path | None = None
     if blank_crops:
         debug_root = exam_out / DEBUG_DIR_NAME
         debug_root.mkdir(parents=True, exist_ok=True)
+    # Always emit enhanced copies of the student crops — they're useful in
+    # the marker UI even when no sheet PDF is supplied for attempt
+    # detection (faint pencil is hard to read at any time).
+    enhanced_root = exam_out / ENHANCED_DIR_NAME
+    enhanced_root.mkdir(parents=True, exist_ok=True)
 
     doc = pymupdf.open(pdf_path)
 
@@ -474,6 +520,7 @@ def extract(
             doc, group, qs_by_page, exam_out, pages_per_student, dpi,
             blank_crops=blank_crops,
             debug_root=debug_root,
+            enhanced_root=enhanced_root,
         )
         manifest_rows.append(row)
         attempts_rows.extend(student_attempts)
@@ -511,6 +558,7 @@ def _extract_one_student(
     dpi: int,
     blank_crops: dict[str, np.ndarray] | None = None,
     debug_root: Path | None = None,
+    enhanced_root: Path | None = None,
 ) -> tuple[dict, list[dict]]:
     base_row = {
         "student_class": group.student_class,
@@ -530,6 +578,9 @@ def _extract_one_student(
     debug_dir = (debug_root / group.folder_name) if debug_root is not None else None
     if debug_dir is not None:
         debug_dir.mkdir(parents=True, exist_ok=True)
+    enhanced_dir = (enhanced_root / group.folder_name) if enhanced_root is not None else None
+    if enhanced_dir is not None:
+        enhanced_dir.mkdir(parents=True, exist_ok=True)
 
     blank_crops = blank_crops or {}
     n_extracted = 0
@@ -543,6 +594,11 @@ def _extract_one_student(
         for q in qs:
             crop = crop_region(page_img, q["bbox"])
             cv2.imwrite(str(student_dir / f"{q['q']}.png"), crop)
+            if enhanced_dir is not None:
+                cv2.imwrite(
+                    str(enhanced_dir / f"{q['q']}.png"),
+                    _enhance_for_display(crop),
+                )
             n_extracted += 1
             if not blank_crops:
                 continue
@@ -626,6 +682,8 @@ def rescore(exam_dir: Path) -> None:
 
     debug_root = exam_dir / DEBUG_DIR_NAME
     debug_root.mkdir(parents=True, exist_ok=True)
+    enhanced_root = exam_dir / ENHANCED_DIR_NAME
+    enhanced_root.mkdir(parents=True, exist_ok=True)
 
     attempts_rows: list[dict] = []
     student_count = 0
@@ -635,6 +693,8 @@ def rescore(exam_dir: Path) -> None:
             continue
         debug_dir = debug_root / entry
         debug_dir.mkdir(parents=True, exist_ok=True)
+        enhanced_dir = enhanced_root / entry
+        enhanced_dir.mkdir(parents=True, exist_ok=True)
         scored_this_student = 0
         for fname in sorted(os.listdir(student_dir)):
             if not fname.lower().endswith(".png"):
@@ -646,6 +706,10 @@ def rescore(exam_dir: Path) -> None:
             student_crop = cv2.imread(str(student_dir / fname))
             if student_crop is None:
                 continue
+            cv2.imwrite(
+                str(enhanced_dir / fname),
+                _enhance_for_display(student_crop),
+            )
             (residual, largest_blob_px, color_ink_px,
              largest_mask, ink_mask, color_mask,
              aligned_blank, dx, dy) = _residual_ink_metrics(blank_crop, student_crop)
