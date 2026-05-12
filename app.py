@@ -43,6 +43,11 @@ DEFAULT_PDF_REL = Path("workScans/10MATD_combinedTEST.pdf")
 _QMARK_WORK = os.environ.get("QMARK_WORK_DIR", "")
 QMARK_ASSIGNMENT_NAME = os.environ.get("QMARK_ASSIGNMENT_NAME", "").strip()
 QMARK_CLASS_NAME = os.environ.get("QMARK_CLASS_NAME", "").strip()
+# Blank worksheet PDF supplied by the dashboard. When present, extract.py
+# also crops a reference "empty" version of each question and classifies
+# every student crop as attempted/unattempted/borderline — see attempts.csv
+# under each exam's output folder.
+QMARK_SHEET_PATH = os.environ.get("QMARK_SHEET_PATH", "").strip()
 
 
 def _qmark_output_name() -> str:
@@ -106,6 +111,8 @@ class Launcher(QMainWindow):
         qmark_output = _qmark_output_name()
         if qmark_output:
             self.exam_name_edit.setText(qmark_output)
+        if QMARK_SHEET_PATH:
+            self.sheet_edit.setText(QMARK_SHEET_PATH)
 
     # ---------- layout ----------
 
@@ -133,6 +140,18 @@ class Launcher(QMainWindow):
         tpl_btn.clicked.connect(self._browse_template)
         tpl_row.addWidget(tpl_btn)
         outer.addLayout(tpl_row)
+
+        sheet_row = QHBoxLayout()
+        sheet_row.addWidget(QLabel("Sheet PDF:"))
+        self.sheet_edit = QLineEdit()
+        self.sheet_edit.setPlaceholderText(
+            "Optional — blank worksheet for empty-question reference"
+        )
+        sheet_row.addWidget(self.sheet_edit, 1)
+        sheet_btn = QPushButton("Browse...")
+        sheet_btn.clicked.connect(self._browse_sheet)
+        sheet_row.addWidget(sheet_btn)
+        outer.addLayout(sheet_row)
 
         out_row = QHBoxLayout()
         out_row.addWidget(QLabel("Output name:"))
@@ -265,6 +284,22 @@ class Launcher(QMainWindow):
         if picked:
             self.tpl_edit.setText(picked)
 
+    def _browse_sheet(self) -> None:
+        qmark_sheets = os.environ.get("QMARK_SHEETS_DIR", "").strip()
+        current = self.sheet_edit.text().strip()
+        if current and Path(current).parent.is_dir():
+            initial = Path(current).parent
+        elif qmark_sheets and Path(qmark_sheets).is_dir():
+            initial = Path(qmark_sheets)
+        else:
+            initial = HERE
+        picked, _ = QFileDialog.getOpenFileName(
+            self, "Pick blank worksheet PDF", str(initial),
+            "PDF files (*.pdf);;All files (*.*)",
+        )
+        if picked:
+            self.sheet_edit.setText(picked)
+
     def _run_in_thread(self, work) -> None:
         threading.Thread(target=work, daemon=True).start()
 
@@ -393,12 +428,36 @@ class Launcher(QMainWindow):
             def flush(self) -> None:
                 pass
 
+        sheet_pdf: Path | None = None
+        sheet_str = self.sheet_edit.text().strip()
+        if sheet_str:
+            candidate = Path(sheet_str)
+            if not candidate.is_absolute():
+                candidate = (HERE / candidate).resolve()
+            if candidate.exists():
+                sheet_pdf = candidate
+                self._append_log(f"Blank reference: {candidate}")
+            else:
+                self._append_log(
+                    f"WARNING: Sheet PDF {candidate} not found; "
+                    "attempt detection disabled."
+                )
+        else:
+            self._append_log(
+                "No Sheet PDF — attempt detection disabled "
+                "(no _blank/ or attempts.csv will be written)."
+            )
+
         def work() -> None:
             try:
                 from extract import extract as run_extract
 
                 with contextlib.redirect_stdout(_LogStream()):
-                    run_extract(pdf, tpl, OUTPUT_DIR, dpi=300, exam_name_override=exam_name)
+                    run_extract(
+                        pdf, tpl, OUTPUT_DIR, dpi=300,
+                        exam_name_override=exam_name,
+                        sheet_pdf=sheet_pdf,
+                    )
                 log_signal.emit("Extract finished.\n")
             except SystemExit as e:
                 log_signal.emit(f"Extract aborted: {e}\n")
