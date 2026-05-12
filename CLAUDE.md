@@ -38,6 +38,11 @@ QR detection rate on `10MATD_combinedTEST.pdf` at 250 DPI: 47/52 plain, 52/52 wi
 output/
 └── <exam_name>/                          # e.g. workscan10Dpretest/
     ├── manifest.csv                      # one row per student
+    ├── attempts.csv                      # only if --sheet-pdf was supplied
+    ├── _blank/                           # only if --sheet-pdf was supplied
+    │   ├── Q01.png                       # the unstamped sheet, cropped through the same template
+    │   ├── Q02.png
+    │   └── ...
     ├── 10MATD_Ruby/
     │   ├── Q01.png
     │   ├── Q02.png
@@ -50,9 +55,24 @@ output/
 
 Conventions:
 
-- **Student folder name:** `<class>_<firstname>` (the only thing the QR gives us).
+- **Student folder name:** `<class>_<firstname>` (the only thing the QR gives us). The marker should skip any folder starting with `_` (currently just `_blank`).
 - **Question file name:** `Q01.png` ... `QNN.png`. Zero-padded so a file-manager sort matches numeric order. Always PNG (lossless — pen strokes stay sharp).
 - **`manifest.csv`** columns: `student_class, student_name, packet_pdf_pages, qr_status_per_page, n_questions_extracted, notes`. `qr_status_per_page` is comma-joined per-page values from {`decoded`, `preprocessed`, `inferred`, `unknown`} — useful for flagging crops that came from a recovered/inferred page vs a confident decode.
+
+## Attempt detection (when --sheet-pdf is supplied)
+
+When the dashboard launches OpenCrop it sets `QMARK_SHEET_PATH` to the unstamped worksheet PDF; the same value can be passed on the CLI as `--sheet-pdf`. When present, `extract.py` renders that blank sheet through the *same template* and writes:
+
+- **`_blank/Q01.png … QNN.png`** — reference "empty" crops, useful for diffs in the marker UI and as a visual baseline.
+- **`attempts.csv`** with columns `student_folder, q, status, blank_ink_ratio, student_ink_ratio, delta`. `status` is one of:
+  - `attempted` — the student's crop has substantially more ink than the blank (delta ≥ 2%).
+  - `borderline` — small but non-zero increase (0.5–2%); worth a human re-check.
+  - `unattempted` — delta < 0.5%; the marker UI can default the score to 0 and grey out the question. Click-through should still let the teacher override.
+  - `unknown` — no blank reference available for this Q (sheet PDF had fewer pages than the packet, etc).
+
+The detector uses a fixed grayscale threshold (`INK_THRESHOLD = 180`) and compares dark-pixel ratios rather than per-pixel subtraction, so it's robust to small scan skew/translation without needing alignment. Thresholds live at the top of `extract.py` (`DELTA_UNATTEMPTED`, `DELTA_BORDERLINE`) — tune there if false positives/negatives become a problem in real use.
+
+When `attempts.csv` is missing, the marker should fall back to "all unknown" — i.e. treat every question as attempted by default and skip the greying behaviour.
 
 ## Template YAML schema
 
@@ -96,6 +116,8 @@ python make_template.py workScans\10MATD_combinedTEST.pdf
 # Extract per-question crops to disk (optional — see "on-the-fly" below)
 python extract.py workScans\10MATD_combinedTEST.pdf 10MATD_combinedTEST.yaml output\
 # Custom DPI: --dpi 400
+# With attempt detection (writes _blank/ + attempts.csv):
+python extract.py workScans\10MATD_combinedTEST.pdf 10MATD_combinedTEST.yaml output\ --sheet-pdf Sheets\10MATD_combinedTEST.pdf
 ```
 
 ## On-the-fly crop access (preferred for the marker)
