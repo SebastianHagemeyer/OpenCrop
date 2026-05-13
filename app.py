@@ -19,6 +19,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -171,6 +172,13 @@ class Launcher(QMainWindow):
         self.btn_open.clicked.connect(self._open_output)
         for b in (self.btn_check, self.btn_define, self.btn_extract, self.btn_open):
             actions.addWidget(b)
+        self.skip_existing_cb = QCheckBox("Skip students already in manifest")
+        self.skip_existing_cb.setToolTip(
+            "When on, Extract reads manifest.csv first and skips any "
+            "student already listed there — newly-scanned students get "
+            "appended without overwriting prior work."
+        )
+        actions.addWidget(self.skip_existing_cb)
         actions.addStretch(1)
         outer.addLayout(actions)
 
@@ -448,6 +456,10 @@ class Launcher(QMainWindow):
                 "(no _blank/ or attempts.csv will be written)."
             )
 
+        skip_existing = self.skip_existing_cb.isChecked()
+        if skip_existing:
+            self._append_log("Skip-existing: on (students already in manifest.csv will be left alone).")
+
         def work() -> None:
             try:
                 from extract import extract as run_extract
@@ -457,6 +469,7 @@ class Launcher(QMainWindow):
                         pdf, tpl, OUTPUT_DIR, dpi=300,
                         exam_name_override=exam_name,
                         sheet_pdf=sheet_pdf,
+                        skip_existing=skip_existing,
                     )
                 log_signal.emit("Extract finished.\n")
             except SystemExit as e:

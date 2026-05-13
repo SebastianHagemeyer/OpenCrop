@@ -2,21 +2,24 @@
 
 Usage:
     python extract.py <pdf> <template.yaml> <output_dir> [--dpi 300]
-        [--sheet-pdf <blank_sheet.pdf>]
+        [--sheet-pdf <blank_sheet.pdf>] [--skip-existing]
 
 Output layout:
     <output_dir>/<exam>/manifest.csv
     <output_dir>/<exam>/<class>_<firstname>/Q01.png ... QNN.png
 
-When a blank sheet PDF is supplied (--sheet-pdf, or QMARK_SHEET_PATH env
-var), the same template is applied to the unstamped worksheet to produce
-reference crops under <output>/<exam>/_blank/<Q>.png. Each student crop
-is then compared against its blank reference using an aligned residual-
-ink detector (see _residual_ink_metrics), and the verdict per (student,
-question) is written to <output>/<exam>/attempts.csv along with the
-applied alignment shift. A side-by-side debug PNG for every (student, q)
-lands at <output>/<exam>/_debug/<student>/<q>.png — useful when tuning
-the thresholds or sanity-checking false positives.
+manifest.csv has one row per (student, q): `student_folder, q, status`.
+Status is one of: attempted, unattempted, borderline, unknown. Without a
+sheet PDF every status is "unknown". With a sheet PDF the unstamped
+worksheet is rendered through the same template into
+<output>/<exam>/_blank/<Q>.png and each student crop is compared against
+its blank reference (see _residual_ink_metrics + _classify_attempt) to
+fill in real attempted/unattempted/borderline verdicts.
+
+--skip-existing reads the prior manifest and skips any student already
+in it, then appends rows for newly-scanned students. Use this to merge
+later scan PDFs into the same assignment without re-extracting (or
+re-overwriting) work that has already been marked.
 """
 
 from __future__ import annotations
@@ -106,9 +109,8 @@ ATT_MIN_COLOR_INK_PX = 200           # any cluster of coloured pen ink above
                                      # this is almost certainly real writing
 
 BLANK_DIR_NAME = "_blank"
-DEBUG_DIR_NAME = "_debug"
 ENHANCED_DIR_NAME = "_enhanced"
-ATTEMPTS_CSV_NAME = "attempts.csv"
+MANIFEST_CSV_NAME = "manifest.csv"
 
 
 def render_page(doc: pymupdf.Document, pdf_page_number: int, dpi: int) -> np.ndarray:
@@ -350,66 +352,6 @@ def _classify_attempt(residual_ratio: float, largest_blob_px: int, color_ink_px:
     return "borderline"
 
 
-def _build_debug_image(
-    aligned_blank_gray: np.ndarray,
-    student_crop: np.ndarray,
-    ink_mask_clean: np.ndarray,
-    largest_blob_mask: np.ndarray,
-    color_mask: np.ndarray,
-    status: str,
-    residual: float,
-    largest_blob_px: int,
-    color_ink_px: int,
-    dx: float,
-    dy: float,
-) -> np.ndarray:
-    """Three-panel side-by-side: aligned blank | student | residual overlay.
-
-    Overlay panel: student crop with all detected residual-ink pixels in
-    red, and the LARGEST connected component re-painted in orange on top
-    — so a quick look tells you (a) what the detector counted as ink, and
-    (b) whether the biggest contiguous chunk looks like real handwriting
-    or like a smear of scattered noise.
-
-    Header bar shows verdict, both metrics, and the alignment shift.
-    """
-    if student_crop.ndim == 2:
-        student_show = cv2.cvtColor(student_crop, cv2.COLOR_GRAY2BGR)
-    else:
-        student_show = student_crop
-    blank_show = cv2.cvtColor(aligned_blank_gray, cv2.COLOR_GRAY2BGR)
-    h, w = student_show.shape[:2]
-    if blank_show.shape[:2] != (h, w):
-        blank_show = cv2.resize(blank_show, (w, h))
-
-    overlay = student_show.copy()
-    color_b = color_mask.astype(bool)
-    all_ink = ink_mask_clean.astype(bool)
-    big = largest_blob_mask.astype(bool)
-    overlay[all_ink] = (0, 0, 255)        # red: all binary-residual ink
-    overlay[big]     = (0, 165, 255)      # orange: largest cluster
-    overlay[color_b] = (255, 0, 255)      # magenta: coloured-pen pixels
-
-    sep_w = 6
-    sep = np.full((h, sep_w, 3), 80, dtype=np.uint8)
-    panel = np.hstack([blank_show, sep, student_show, sep, overlay])
-
-    label = (
-        f"{status:>11}  "
-        f"residual={residual*100:6.3f}%  "
-        f"cluster_ink={largest_blob_px:>5}px  "
-        f"color_ink={color_ink_px:>5}px  "
-        f"shift=({dx:+.1f},{dy:+.1f})"
-    )
-    label_h = 28
-    label_bar = np.full((label_h, panel.shape[1], 3), 30, dtype=np.uint8)
-    cv2.putText(
-        label_bar, label, (8, 19), cv2.FONT_HERSHEY_SIMPLEX,
-        0.55, (255, 255, 255), 1, cv2.LINE_AA,
-    )
-    return np.vstack([label_bar, panel])
-
-
 def _render_blank_references(
     sheet_pdf: Path,
     questions: list[dict],
@@ -468,6 +410,7 @@ def extract(
     dpi: int,
     exam_name_override: str | None = None,
     sheet_pdf: Path | None = None,
+    skip_existing: bool = False,
 ) -> None:
     template = yaml.safe_load(template_path.read_text(encoding="utf-8"))
     pages_per_student: int = template["pages_per_student"]
@@ -492,6 +435,24 @@ def extract(
 
     exam_out = output_dir / exam_name
     exam_out.mkdir(parents=True, exist_ok=True)
+    manifest_path = exam_out / MANIFEST_CSV_NAME
+
+    # Carry forward prior manifest rows for students we'll skip. Without
+    # this, re-running with --skip-existing on a partial scan would erase
+    # the previous batch's statuses from manifest.csv.
+    prior_rows: list[dict] = []
+    skipped_folders: set[str] = set()
+    if skip_existing and manifest_path.is_file():
+        with manifest_path.open(encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                folder = (row.get("student_folder") or "").strip()
+                q_code = (row.get("q") or "").strip()
+                status = (row.get("status") or "").strip()
+                if folder and q_code and status:
+                    prior_rows.append({"student_folder": folder, "q": q_code, "status": status})
+                    skipped_folders.add(folder)
+        if skipped_folders:
+            print(f"  skip-existing: {len(skipped_folders)} student(s) already in manifest")
 
     blank_crops: dict[str, np.ndarray] = {}
     if sheet_pdf is not None:
@@ -499,11 +460,6 @@ def extract(
             sheet_pdf, questions, pages_per_student, exam_out / BLANK_DIR_NAME, dpi,
         )
 
-    debug_root: Path | None = None
-    enhanced_root: Path | None = None
-    if blank_crops:
-        debug_root = exam_out / DEBUG_DIR_NAME
-        debug_root.mkdir(parents=True, exist_ok=True)
     # Always emit enhanced copies of the student crops — they're useful in
     # the marker UI even when no sheet PDF is supplied for attempt
     # detection (faint pencil is hard to read at any time).
@@ -512,39 +468,24 @@ def extract(
 
     doc = pymupdf.open(pdf_path)
 
-    manifest_rows: list[dict] = []
-    attempts_rows: list[dict] = []
+    manifest_rows: list[dict] = list(prior_rows)
     print(f"\nExtracting {len(questions)} questions per student at {dpi} DPI...")
     for group in groups:
-        row, student_attempts = _extract_one_student(
+        if group.folder_name in skipped_folders:
+            print(f"  [SKIP] {group.folder_name:<28} (already in manifest)")
+            continue
+        rows, n_extracted, note = _extract_one_student(
             doc, group, qs_by_page, exam_out, pages_per_student, dpi,
             blank_crops=blank_crops,
-            debug_root=debug_root,
             enhanced_root=enhanced_root,
         )
-        manifest_rows.append(row)
-        attempts_rows.extend(student_attempts)
-        marker = "OK  " if row["notes"] == "" else "WARN"
-        print(f"  [{marker}] {group.folder_name:<28} {row['n_questions_extracted']:>3} crops  {row['notes']}")
+        marker = "OK  " if not note else "WARN"
+        print(f"  [{marker}] {group.folder_name:<28} {n_extracted:>3} crops  {note}")
+        manifest_rows.extend(rows)
 
     doc.close()
 
-    manifest_path = exam_out / "manifest.csv"
-    with manifest_path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "student_class", "student_name",
-            "packet_pdf_pages", "qr_status_per_page",
-            "n_questions_extracted", "notes",
-        ])
-        writer.writeheader()
-        writer.writerows(manifest_rows)
-
-    if blank_crops:
-        attempts_path = exam_out / ATTEMPTS_CSV_NAME
-        _write_attempts_csv(attempts_path, attempts_rows)
-        if debug_root is not None:
-            print(f"Debug images:    {debug_root}")
-
+    _write_manifest_csv(manifest_path, manifest_rows)
     print(f"\nDone. Output: {exam_out}")
     print(f"Manifest:    {manifest_path}")
 
@@ -557,34 +498,28 @@ def _extract_one_student(
     pages_per_student: int,
     dpi: int,
     blank_crops: dict[str, np.ndarray] | None = None,
-    debug_root: Path | None = None,
     enhanced_root: Path | None = None,
-) -> tuple[dict, list[dict]]:
-    base_row = {
-        "student_class": group.student_class,
-        "student_name": group.student_name,
-        "packet_pdf_pages": ",".join(str(p.pdf_page_number) for p in group.pages),
-        "qr_status_per_page": ",".join(p.qr_status for p in group.pages),
-        "n_questions_extracted": 0,
-        "notes": "",
-    }
+) -> tuple[list[dict], int, str]:
+    """Returns (manifest_rows, n_extracted, note).
 
+    manifest_rows are (student_folder, q, status) dicts. note is empty on
+    success, or a short failure reason (e.g. page count mismatch) — in
+    that case manifest_rows is empty and the student gets no entries in
+    manifest.csv. The caller surfaces the note in its console log.
+    """
     if len(group.pages) != pages_per_student:
-        base_row["notes"] = f"page count mismatch (got {len(group.pages)}, expected {pages_per_student})"
-        return base_row, []
+        note = f"page count mismatch (got {len(group.pages)}, expected {pages_per_student})"
+        return [], 0, note
 
     student_dir = exam_out / group.folder_name
     student_dir.mkdir(parents=True, exist_ok=True)
-    debug_dir = (debug_root / group.folder_name) if debug_root is not None else None
-    if debug_dir is not None:
-        debug_dir.mkdir(parents=True, exist_ok=True)
     enhanced_dir = (enhanced_root / group.folder_name) if enhanced_root is not None else None
     if enhanced_dir is not None:
         enhanced_dir.mkdir(parents=True, exist_ok=True)
 
     blank_crops = blank_crops or {}
+    rows: list[dict] = []
     n_extracted = 0
-    attempts: list[dict] = []
     for packet_page_idx in range(1, pages_per_student + 1):
         qs = qs_by_page.get(packet_page_idx, [])
         if not qs:
@@ -592,65 +527,44 @@ def _extract_one_student(
         pdf_page_num = group.pages[packet_page_idx - 1].pdf_page_number
         page_img = render_page(doc, pdf_page_num, dpi)
         for q in qs:
+            q_code = q["q"]
             crop = crop_region(page_img, q["bbox"])
-            cv2.imwrite(str(student_dir / f"{q['q']}.png"), crop)
+            cv2.imwrite(str(student_dir / f"{q_code}.png"), crop)
             if enhanced_dir is not None:
                 cv2.imwrite(
-                    str(enhanced_dir / f"{q['q']}.png"),
+                    str(enhanced_dir / f"{q_code}.png"),
                     _enhance_for_display(crop),
                 )
             n_extracted += 1
-            if not blank_crops:
-                continue
-            q_code = q["q"]
-            blank_crop = blank_crops.get(q_code)
+            blank_crop = blank_crops.get(q_code) if blank_crops else None
             if blank_crop is None:
-                attempts.append({
-                    "student_folder": group.folder_name, "q": q_code,
-                    "status": "unknown",
-                    "residual_ratio": "", "alignment_dx": "", "alignment_dy": "",
-                })
-                continue
-            (residual, largest_blob_px, color_ink_px,
-             largest_mask, ink_mask, color_mask,
-             aligned_blank, dx, dy) = _residual_ink_metrics(blank_crop, crop)
-            status = _classify_attempt(residual, largest_blob_px, color_ink_px)
-            attempts.append({
-                "student_folder": group.folder_name, "q": q_code,
+                status = "unknown"
+            else:
+                metrics = _residual_ink_metrics(blank_crop, crop)
+                residual, largest_blob_px, color_ink_px = metrics[0], metrics[1], metrics[2]
+                status = _classify_attempt(residual, largest_blob_px, color_ink_px)
+            rows.append({
+                "student_folder": group.folder_name,
+                "q": q_code,
                 "status": status,
-                "residual_ratio": f"{residual:.5f}",
-                "largest_blob_px": str(largest_blob_px),
-                "color_ink_px": str(color_ink_px),
-                "alignment_dx": f"{dx:+.2f}",
-                "alignment_dy": f"{dy:+.2f}",
             })
-            if debug_dir is not None:
-                debug_img = _build_debug_image(
-                    aligned_blank, crop, ink_mask, largest_mask, color_mask,
-                    status, residual, largest_blob_px, color_ink_px, dx, dy,
-                )
-                cv2.imwrite(str(debug_dir / f"{q_code}.png"), debug_img)
 
-    base_row["n_questions_extracted"] = n_extracted
-    return base_row, attempts
+    return rows, n_extracted, ""
 
 
-def _write_attempts_csv(attempts_path: Path, rows: list[dict]) -> None:
-    with attempts_path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "student_folder", "q", "status",
-            "residual_ratio", "largest_blob_px", "color_ink_px",
-            "alignment_dx", "alignment_dy",
-        ])
+def _write_manifest_csv(manifest_path: Path, rows: list[dict]) -> None:
+    with manifest_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["student_folder", "q", "status"])
         writer.writeheader()
         writer.writerows(rows)
     n_att = sum(1 for r in rows if r["status"] == "attempted")
     n_bord = sum(1 for r in rows if r["status"] == "borderline")
     n_unatt = sum(1 for r in rows if r["status"] == "unattempted")
+    n_unk = sum(1 for r in rows if r["status"] == "unknown")
     print(
-        f"\nAttempt detection: {len(rows)} crops scored — "
-        f"{n_att} attempted, {n_bord} borderline, {n_unatt} unattempted. "
-        f"Written to {attempts_path}"
+        f"\nManifest: {len(rows)} crops — "
+        f"{n_att} attempted, {n_bord} borderline, "
+        f"{n_unatt} unattempted, {n_unk} unknown."
     )
 
 
@@ -658,9 +572,9 @@ def rescore(exam_dir: Path) -> None:
     """Re-run attempt detection against existing crops on disk.
 
     Reuses <exam>/_blank/ and the per-student folders that the previous
-    extract run left behind, recomputes attempts.csv with the current
-    classifier parameters, and refreshes <exam>/_debug/ images. Lets you
-    iterate on thresholds in seconds instead of re-rendering the scan PDF.
+    extract run left behind, and rewrites manifest.csv with the current
+    classifier parameters. Lets you iterate on thresholds in seconds
+    instead of re-rendering the scan PDF.
     """
     if not exam_dir.is_dir():
         sys.exit(f"Exam directory not found: {exam_dir}")
@@ -680,19 +594,15 @@ def rescore(exam_dir: Path) -> None:
         sys.exit(f"No blank crops found in {blank_dir}.")
     print(f"Loaded {len(blank_crops)} blank reference crops from {blank_dir}.")
 
-    debug_root = exam_dir / DEBUG_DIR_NAME
-    debug_root.mkdir(parents=True, exist_ok=True)
     enhanced_root = exam_dir / ENHANCED_DIR_NAME
     enhanced_root.mkdir(parents=True, exist_ok=True)
 
-    attempts_rows: list[dict] = []
+    manifest_rows: list[dict] = []
     student_count = 0
     for entry in sorted(os.listdir(exam_dir)):
         student_dir = exam_dir / entry
         if not student_dir.is_dir() or entry.startswith("_"):
             continue
-        debug_dir = debug_root / entry
-        debug_dir.mkdir(parents=True, exist_ok=True)
         enhanced_dir = enhanced_root / entry
         enhanced_dir.mkdir(parents=True, exist_ok=True)
         scored_this_student = 0
@@ -710,32 +620,19 @@ def rescore(exam_dir: Path) -> None:
                 str(enhanced_dir / fname),
                 _enhance_for_display(student_crop),
             )
-            (residual, largest_blob_px, color_ink_px,
-             largest_mask, ink_mask, color_mask,
-             aligned_blank, dx, dy) = _residual_ink_metrics(blank_crop, student_crop)
+            metrics = _residual_ink_metrics(blank_crop, student_crop)
+            residual, largest_blob_px, color_ink_px = metrics[0], metrics[1], metrics[2]
             status = _classify_attempt(residual, largest_blob_px, color_ink_px)
-            attempts_rows.append({
-                "student_folder": entry, "q": q_code,
-                "status": status,
-                "residual_ratio": f"{residual:.5f}",
-                "largest_blob_px": str(largest_blob_px),
-                "color_ink_px": str(color_ink_px),
-                "alignment_dx": f"{dx:+.2f}",
-                "alignment_dy": f"{dy:+.2f}",
+            manifest_rows.append({
+                "student_folder": entry, "q": q_code, "status": status,
             })
-            debug_img = _build_debug_image(
-                aligned_blank, student_crop, ink_mask, largest_mask, color_mask,
-                status, residual, largest_blob_px, color_ink_px, dx, dy,
-            )
-            cv2.imwrite(str(debug_dir / f"{q_code}.png"), debug_img)
             scored_this_student += 1
         if scored_this_student:
             student_count += 1
             print(f"  scored {scored_this_student:>3} crops for {entry}")
 
     print(f"\n{student_count} students processed.")
-    _write_attempts_csv(exam_dir / ATTEMPTS_CSV_NAME, attempts_rows)
-    print(f"Debug images:    {debug_root}")
+    _write_manifest_csv(exam_dir / MANIFEST_CSV_NAME, manifest_rows)
 
 
 def main() -> None:
@@ -748,8 +645,8 @@ def main() -> None:
         help=(
             "Skip extraction and re-run attempt detection against the crops "
             "already on disk under EXAM_DIR (which must contain _blank/ and "
-            "per-student folders). Refreshes attempts.csv and _debug/ images "
-            "without touching the scan PDF — fast loop for tuning thresholds."
+            "per-student folders). Rewrites manifest.csv without touching the "
+            "scan PDF — fast loop for tuning thresholds."
         ),
     )
     parser.add_argument("pdf", type=Path, nargs="?", help="Path to the scan PDF")
@@ -767,11 +664,19 @@ def main() -> None:
         default=None,
         help=(
             "Blank worksheet PDF — when supplied, the same template is applied "
-            "to it to produce reference crops under <output>/<exam>/_blank/, an "
-            "attempts.csv classifying each student crop as attempted, "
-            "unattempted, or borderline (aligned residual-ink detector), and a "
-            "side-by-side debug PNG per (student, q) under "
-            "<output>/<exam>/_debug/. Defaults to env QMARK_SHEET_PATH."
+            "to it to produce reference crops under <output>/<exam>/_blank/, "
+            "and manifest.csv classifies each student crop as attempted, "
+            "unattempted, or borderline. Defaults to env QMARK_SHEET_PATH."
+        ),
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help=(
+            "Skip any student already present in the prior manifest.csv. "
+            "Their rows are preserved verbatim and newly-scanned students "
+            "are appended — use to merge later scans into an in-progress "
+            "assignment without overwriting work already marked."
         ),
     )
     args = parser.parse_args()
@@ -799,6 +704,7 @@ def main() -> None:
     extract(
         args.pdf, args.template, args.output, dpi=args.dpi,
         exam_name_override=args.exam_name, sheet_pdf=sheet_pdf,
+        skip_existing=args.skip_existing,
     )
 
 
