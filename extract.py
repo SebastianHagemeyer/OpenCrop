@@ -81,7 +81,12 @@ CLUSTER_DILATE_PX = 5                # dilate the surviving ink by this many px
 # printed text is essentially black (very low saturation). Pixels with
 # noticeable saturation and dark-ish value are almost certainly pen ink
 # and provide a clean override signal when present.
-COLOR_SAT_MIN = 40                   # HSV saturation (0-255) above this = colored
+COLOR_SAT_MIN = 80                   # HSV saturation (0-255) above this = colored.
+                                     # Was 40 — too low: scanner chromatic-fringe
+                                     # at edges of printed black text sits in
+                                     # the 30-60 range and was being misread as
+                                     # pen ink, falsely flagging blank pages
+                                     # "attempted". Real pen ink saturates >100.
 COLOR_VAL_MIN = 30                   # avoid near-black noise / bleed-through
 COLOR_VAL_MAX = 220                  # avoid faint paper texture
 _MORPH_KERNEL = np.ones((2, 2), np.uint8)
@@ -187,13 +192,21 @@ def _enhance_for_display(bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(cv2.merge([L_enh, A, B]), cv2.COLOR_LAB2BGR)
 
 
-def _color_ink_pixels(student_crop_bgr: np.ndarray) -> tuple[int, np.ndarray]:
+def _color_ink_pixels(
+    student_crop_bgr: np.ndarray,
+    exclude_mask: np.ndarray | None = None,
+) -> tuple[int, np.ndarray]:
     """Detect coloured pen ink — saturated pixels with dark-ish value.
 
     Printed text is essentially black (very low saturation), so this
     signal cleanly separates blue/red/green pen writing from any
     print-cancellation residue. A clean override when the student wrote
     in colour (most teenagers do). Returns (count, binary_mask).
+
+    `exclude_mask` (non-zero where to exclude) zeros out locations that
+    should not contribute — typically the dilated aligned-blank-ink mask
+    plus the alignment-border strip, so scanner chromatic fringe at the
+    edges of printed worksheet text does not get counted as pen ink.
     """
     if student_crop_bgr.ndim != 3:
         return 0, np.zeros(student_crop_bgr.shape[:2], dtype=np.uint8)
@@ -203,6 +216,8 @@ def _color_ink_pixels(student_crop_bgr: np.ndarray) -> tuple[int, np.ndarray]:
     mask = ((sat > COLOR_SAT_MIN)
             & (val < COLOR_VAL_MAX)
             & (val > COLOR_VAL_MIN)).astype(np.uint8)
+    if exclude_mask is not None and exclude_mask.shape == mask.shape:
+        mask &= (exclude_mask == 0).astype(np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _MORPH_KERNEL)
     return int(mask.sum()), mask
 
@@ -328,7 +343,13 @@ def _residual_ink_metrics(
             largest_blob_px = ink_in_cluster
             largest_blob_mask = (student_only_mask & cluster_pixels)
 
-    color_ink_px, color_mask = _color_ink_pixels(student_crop)
+    # Exclude printed-text neighbourhoods + alignment-border strip from the
+    # colour count: scanner chromatic fringe clusters within 1-2 px of
+    # printed ink edges, exactly where `ab_dilated` is set.
+    color_exclude = cv2.bitwise_or(ab_dilated, cv2.bitwise_not(valid_mask))
+    color_ink_px, color_mask = _color_ink_pixels(
+        student_crop, exclude_mask=color_exclude,
+    )
     return (residual, largest_blob_px, color_ink_px,
             largest_blob_mask, student_only_mask, color_mask,
             aligned_gray, dx, dy)
