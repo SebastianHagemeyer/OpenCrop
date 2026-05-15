@@ -251,6 +251,11 @@ class TemplateEditor(QMainWindow):
         self.current_group_idx = 0
         self.current_page_idx = 0
         self.regions: list[dict] = []
+        # Packet-relative page indices (1-based) that the user marked as
+        # "MC page" — extract.py renders each of these as a full-page
+        # image per student so the MC grader can show what the student
+        # filled in next to the answer cells.
+        self.mc_pages: set[int] = set()
         self.next_q_num = 1
         self._index_token = 0
 
@@ -313,6 +318,17 @@ class TemplateEditor(QMainWindow):
         side_lay.addWidget(self.del_btn)
 
         side_lay.addSpacing(8)
+        self.mc_toggle_btn = QPushButton("Mark this page as MC")
+        self.mc_toggle_btn.setCheckable(True)
+        self.mc_toggle_btn.setToolTip(
+            "Flag the current packet page as a multiple-choice answer "
+            "sheet. Extract will render the whole page (no bboxes) so "
+            "the MC grader can display it alongside the answer cells."
+        )
+        self.mc_toggle_btn.clicked.connect(self._toggle_mc_page)
+        side_lay.addWidget(self.mc_toggle_btn)
+
+        side_lay.addSpacing(8)
         nav = QHBoxLayout()
         self.prev_btn = QPushButton("◀ Prev page")
         self.prev_btn.clicked.connect(self._prev_page)
@@ -341,7 +357,7 @@ class TemplateEditor(QMainWindow):
         """Disable interactive controls while indexing runs on a worker
         thread so the user can't drive the editor into a half-loaded state."""
         for w in (self.student_combo, self.prev_btn, self.next_btn,
-                  self.save_btn, self.del_btn):
+                  self.save_btn, self.del_btn, self.mc_toggle_btn):
             w.setEnabled(not busy)
 
     def _load_pdf(self, path: Path) -> None:
@@ -482,6 +498,7 @@ class TemplateEditor(QMainWindow):
         self.current_group_idx = 0
         self.current_page_idx = 0
         self.regions.clear()
+        self.mc_pages.clear()
         self.next_q_num = 1
         self._refresh_student_combo()
         self._refresh_region_list()
@@ -530,25 +547,58 @@ class TemplateEditor(QMainWindow):
         pixmap = QPixmap.fromImage(qimg)
 
         page_in_packet = self._current_page_in_packet()
-        regions_for_page = [r for r in self.regions if r["page"] == page_in_packet]
+        is_mc_page = page_in_packet in self.mc_pages
+        regions_for_page = (
+            [] if is_mc_page
+            else [r for r in self.regions if r["page"] == page_in_packet]
+        )
         self.page_view.set_page(pixmap, regions_for_page)
 
         n_pages = len(self._current_group().pages)
+        suffix = "  — MC page (whole-page capture)" if is_mc_page else ""
         self.page_label.setText(
-            f"Packet page {page_in_packet} of {n_pages}  (PDF page {pdf_pg})"
+            f"Packet page {page_in_packet} of {n_pages}  (PDF page {pdf_pg}){suffix}"
         )
-        self.defining_label.setText(_code_for(self.next_q_num))
+        self.defining_label.setText(
+            "MC (whole page)" if is_mc_page else _code_for(self.next_q_num)
+        )
+        # Reflect the current page's MC state without re-firing the toggle.
+        self.mc_toggle_btn.blockSignals(True)
+        self.mc_toggle_btn.setChecked(is_mc_page)
+        self.mc_toggle_btn.blockSignals(False)
 
     # ---------- Region handling ----------
 
     def _on_rect_drawn(self, nx0: float, ny0: float, nx1: float, ny1: float) -> None:
+        page_in_packet = self._current_page_in_packet()
+        if page_in_packet in self.mc_pages:
+            # MC pages are whole-page captures — bboxes don't apply here.
+            return
         self.regions.append({
             "q": _code_for(self.next_q_num),
-            "page": self._current_page_in_packet(),
+            "page": page_in_packet,
             "bbox": [round(nx0, 4), round(ny0, 4), round(nx1, 4), round(ny1, 4)],
         })
         self.next_q_num += 1
         self._refresh_region_list()
+        self._render_current_page()
+
+    def _toggle_mc_page(self, checked: bool) -> None:
+        if not self.groups:
+            return
+        page_in_packet = self._current_page_in_packet()
+        if checked:
+            # Marking as MC drops any bboxes the user may already have
+            # drawn on this page (whole-page capture supersedes regions),
+            # then renumbers so question codes stay contiguous.
+            before = len(self.regions)
+            self.regions = [r for r in self.regions if r["page"] != page_in_packet]
+            if len(self.regions) != before:
+                self._renumber()
+                self._refresh_region_list()
+            self.mc_pages.add(page_in_packet)
+        else:
+            self.mc_pages.discard(page_in_packet)
         self._render_current_page()
 
     def _refresh_region_list(self) -> None:
@@ -592,8 +642,11 @@ class TemplateEditor(QMainWindow):
     # ---------- Save ----------
 
     def _save(self) -> None:
-        if not self.regions:
-            QMessageBox.warning(self, "Nothing to save", "Define some regions first.")
+        if not self.regions and not self.mc_pages:
+            QMessageBox.warning(
+                self, "Nothing to save",
+                "Define some regions or mark at least one page as MC first.",
+            )
             return
         pages_per_student = len(self._current_group().pages)
         initial_dir = _writable_templates_dir(self.pdf_path)
@@ -603,7 +656,11 @@ class TemplateEditor(QMainWindow):
         )
         if not path:
             return
-        regions_sorted = sorted(self.regions, key=lambda r: int(r["q"][1:]))
+        # Question codes may not start with 'Q' once QMARK_QUESTION_CODES
+        # is in play (e.g. "Part_B_Q1"), so sort lexicographically on the
+        # whole code rather than parsing an int suffix.
+        regions_sorted = sorted(self.regions, key=lambda r: str(r["q"]))
+        mc_pages_sorted = sorted(self.mc_pages)
         template = {
             "exam": self.pdf_path.stem,
             "reference_student": self._current_group().folder_name,
@@ -613,10 +670,18 @@ class TemplateEditor(QMainWindow):
                 for r in regions_sorted
             ],
         }
+        if mc_pages_sorted:
+            template["mc_pages"] = mc_pages_sorted
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             yaml.safe_dump(template, f, sort_keys=False)
-        QMessageBox.information(self, "Saved", f"Wrote {len(regions_sorted)} regions to:\n{path}")
+        mc_suffix = (
+            f" + {len(mc_pages_sorted)} MC page(s)" if mc_pages_sorted else ""
+        )
+        QMessageBox.information(
+            self, "Saved",
+            f"Wrote {len(regions_sorted)} regions{mc_suffix} to:\n{path}",
+        )
 
     # ---------- Resize hook (re-render so scaling stays sharp) ----------
 

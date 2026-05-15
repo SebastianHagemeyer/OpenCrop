@@ -116,6 +116,10 @@ ATT_MIN_COLOR_INK_PX = 200           # any cluster of coloured pen ink above
 BLANK_DIR_NAME = "_blank"
 ENHANCED_DIR_NAME = "_enhanced"
 MANIFEST_CSV_NAME = "manifest.csv"
+# Per-student MC page files are named MC_p<N>.png where N is the
+# 1-based packet-relative page index. The MC grader in qmark looks for
+# this pattern under <work_dir>/<student_folder>/.
+MC_PAGE_FNAME_FMT = "MC_p{page}.png"
 
 
 def render_page(doc: pymupdf.Document, pdf_page_number: int, dpi: int) -> np.ndarray:
@@ -432,11 +436,22 @@ def extract(
     exam_name_override: str | None = None,
     sheet_pdf: Path | None = None,
     skip_existing: bool = False,
+    include_mc_pages: bool = True,
 ) -> None:
     template = yaml.safe_load(template_path.read_text(encoding="utf-8"))
     pages_per_student: int = template["pages_per_student"]
     questions: list[dict] = template["questions"]
     exam_name: str = exam_name_override or template.get("exam", pdf_path.stem)
+    # mc_pages is optional in older templates. Coerce to a sorted list of
+    # ints + clip to pages_per_student so a template mismatch doesn't
+    # crash the extractor mid-batch.
+    raw_mc = template.get("mc_pages") or []
+    mc_pages: list[int] = sorted({
+        int(p) for p in raw_mc
+        if isinstance(p, (int, float)) and 1 <= int(p) <= pages_per_student
+    })
+    if not include_mc_pages:
+        mc_pages = []
 
     template_pages = sorted({q["page"] for q in questions})
     if template_pages and max(template_pages) > pages_per_student:
@@ -490,7 +505,10 @@ def extract(
     doc = pymupdf.open(pdf_path)
 
     manifest_rows: list[dict] = list(prior_rows)
-    print(f"\nExtracting {len(questions)} questions per student at {dpi} DPI...")
+    mc_suffix = (
+        f" + {len(mc_pages)} MC page(s)" if mc_pages else ""
+    )
+    print(f"\nExtracting {len(questions)} questions per student{mc_suffix} at {dpi} DPI...")
     for group in groups:
         if group.folder_name in skipped_folders:
             print(f"  [SKIP] {group.folder_name:<28} (already in manifest)")
@@ -499,6 +517,7 @@ def extract(
             doc, group, qs_by_page, exam_out, pages_per_student, dpi,
             blank_crops=blank_crops,
             enhanced_root=enhanced_root,
+            mc_pages=mc_pages,
         )
         marker = "OK  " if not note else "WARN"
         print(f"  [{marker}] {group.folder_name:<28} {n_extracted:>3} crops  {note}")
@@ -520,6 +539,7 @@ def _extract_one_student(
     dpi: int,
     blank_crops: dict[str, np.ndarray] | None = None,
     enhanced_root: Path | None = None,
+    mc_pages: list[int] | None = None,
 ) -> tuple[list[dict], int, str]:
     """Returns (manifest_rows, n_extracted, note).
 
@@ -539,14 +559,28 @@ def _extract_one_student(
         enhanced_dir.mkdir(parents=True, exist_ok=True)
 
     blank_crops = blank_crops or {}
+    mc_pages_set = set(mc_pages or [])
     rows: list[dict] = []
     n_extracted = 0
     for packet_page_idx in range(1, pages_per_student + 1):
         qs = qs_by_page.get(packet_page_idx, [])
-        if not qs:
+        is_mc = packet_page_idx in mc_pages_set
+        if not qs and not is_mc:
             continue
         pdf_page_num = group.pages[packet_page_idx - 1].pdf_page_number
         page_img = render_page(doc, pdf_page_num, dpi)
+        if is_mc:
+            # Whole-page capture for the MC sheet — no bbox, no attempt
+            # classification, no manifest row. The MC grader picks these
+            # up by filename so the teacher can read what was filled in.
+            mc_fname = MC_PAGE_FNAME_FMT.format(page=packet_page_idx)
+            cv2.imwrite(str(student_dir / mc_fname), page_img)
+            if enhanced_dir is not None:
+                cv2.imwrite(
+                    str(enhanced_dir / mc_fname),
+                    _enhance_for_display(page_img),
+                )
+            n_extracted += 1
         for q in qs:
             q_code = q["q"]
             crop = crop_region(page_img, q["bbox"])
@@ -700,6 +734,14 @@ def main() -> None:
             "assignment without overwriting work already marked."
         ),
     )
+    parser.add_argument(
+        "--no-mc-pages",
+        action="store_true",
+        help=(
+            "Ignore the template's mc_pages list — skip rendering whole-page "
+            "MC captures even if the template marks any."
+        ),
+    )
     args = parser.parse_args()
 
     if args.rescore is not None:
@@ -726,6 +768,7 @@ def main() -> None:
         args.pdf, args.template, args.output, dpi=args.dpi,
         exam_name_override=args.exam_name, sheet_pdf=sheet_pdf,
         skip_existing=args.skip_existing,
+        include_mc_pages=not args.no_mc_pages,
     )
 
 

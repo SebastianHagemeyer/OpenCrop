@@ -179,6 +179,16 @@ class Launcher(QMainWindow):
             "appended without overwriting prior work."
         )
         actions.addWidget(self.skip_existing_cb)
+        self.include_mc_cb = QCheckBox("Include MC pages")
+        self.include_mc_cb.setChecked(True)
+        self.include_mc_cb.setToolTip(
+            "When on, the template's mc_pages list is honoured: each "
+            "marked packet page is written as a whole-page image "
+            "(MC_p<N>.png) per student so the MC grader can show what "
+            "the student filled in. Untick to skip MC captures even if "
+            "the template marks any."
+        )
+        actions.addWidget(self.include_mc_cb)
         actions.addStretch(1)
         outer.addLayout(actions)
 
@@ -459,6 +469,11 @@ class Launcher(QMainWindow):
         skip_existing = self.skip_existing_cb.isChecked()
         if skip_existing:
             self._append_log("Skip-existing: on (students already in manifest.csv will be left alone).")
+        include_mc_pages = self.include_mc_cb.isChecked()
+        if not include_mc_pages:
+            self._append_log(
+                "Include MC pages: off (any mc_pages in the template will be ignored)."
+            )
 
         def work() -> None:
             try:
@@ -470,6 +485,7 @@ class Launcher(QMainWindow):
                         exam_name_override=exam_name,
                         sheet_pdf=sheet_pdf,
                         skip_existing=skip_existing,
+                        include_mc_pages=include_mc_pages,
                     )
                 log_signal.emit("Extract finished.\n")
             except SystemExit as e:

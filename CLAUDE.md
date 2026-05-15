@@ -122,6 +122,12 @@ questions:
     page: 2
     bbox: [0.05, 0.10, 0.95, 0.30]
   # ...
+mc_pages: [3]                             # optional — packet-relative page indices that are MC
+                                          # answer sheets. extract.py renders each as a whole-page
+                                          # image MC_p<N>.png per student (no bbox, no manifest row).
+                                          # qmark's MC grader picks them up by filename and shows
+                                          # them next to the answer cells. Toggle in the region
+                                          # editor with the "Mark this page as MC" button.
 ```
 
 - **`bbox` is normalized.** Multiply by rendered page width/height to get pixel coords. This makes the template DPI-independent — extract.py can render at any DPI and the same template still works.
