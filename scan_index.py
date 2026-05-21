@@ -18,6 +18,7 @@ and surface in the manifest.
 
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,7 +36,7 @@ class PageRecord:
     page_in_packet: int | None    # 1-based, from QR
     pages_total: int | None       # total pages in the student's packet
     qr_raw: str | None
-    qr_status: str                # "decoded" | "preprocessed" | "inferred" | "unknown"
+    qr_status: str                # "decoded" | "preprocessed" | "inferred" | "override" | "unknown"
 
 
 @dataclass
@@ -120,8 +121,85 @@ def _parse_qr(text: str) -> tuple[str, str, int | None, int | None] | None:
     return None
 
 
+def sidecar_overrides_path(pdf_path: Path) -> Path:
+    """The user-editable JSON file we look for next to the scan PDF."""
+    return pdf_path.with_suffix(pdf_path.suffix + ".qrfix.json")
+
+
+def load_sidecar_overrides(pdf_path: Path) -> dict[int, dict]:
+    """Read the recovery dialog's overrides for this scan, if any.
+
+    Schema on disk:
+        {"overrides": {"23": {"class": "10MATD", "name": "Shyla",
+                              "page_in_packet": 1, "pages_total": 2}, ...}}
+
+    Keys are stringified 1-based PDF page numbers. Returns a dict keyed
+    by int; an unreadable or missing file gives {}.
+    """
+    p = sidecar_overrides_path(pdf_path)
+    if not p.is_file():
+        return {}
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            blob = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    raw = blob.get("overrides") or {}
+    out: dict[int, dict] = {}
+    for k, v in raw.items():
+        try:
+            out[int(k)] = v
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def save_sidecar_overrides(pdf_path: Path, overrides: dict[int, dict]) -> Path:
+    """Write the recovery dialog's overrides next to the scan PDF.
+
+    Keys must be 1-based PDF page numbers (ints). Returns the path
+    written. Overwrites any existing sidecar.
+    """
+    p = sidecar_overrides_path(pdf_path)
+    blob = {"overrides": {str(k): v for k, v in overrides.items()}}
+    with p.open("w", encoding="utf-8") as f:
+        json.dump(blob, f, indent=2, sort_keys=True)
+    return p
+
+
+def _apply_overrides(pages: list[PageRecord], overrides: dict[int, dict]) -> None:
+    """Stamp manual overrides onto pages before inference runs.
+
+    Lets the recovery dialog rescue pages whose QR was torn, scribbled
+    over, or otherwise undecodable. Pages with a valid override become
+    anchors that ``_infer_missing`` can lean on for nearby still-unknown
+    pages.
+    """
+    for p in pages:
+        ov = overrides.get(p.pdf_page_number)
+        if not ov:
+            continue
+        cls = (ov.get("class") or "").strip()
+        name = (ov.get("name") or "").strip()
+        if not cls or not name:
+            continue
+        p.student_class = cls
+        p.student_name = name
+        pip = ov.get("page_in_packet")
+        tot = ov.get("pages_total")
+        if isinstance(pip, int) and isinstance(tot, int) and 1 <= pip <= tot:
+            p.page_in_packet = pip
+            p.pages_total = tot
+        p.qr_status = "override"
+
+
 def index_pdf(pdf_path: Path, dpi: int = 250) -> list[PageRecord]:
-    """Decode the QR on every page of the PDF."""
+    """Decode the QR on every page of the PDF.
+
+    If a ``<pdf>.qrfix.json`` sidecar exists next to the PDF, its manual
+    overrides are applied after QR detection (used to rescue torn or
+    scribbled-over QRs via the recovery dialog).
+    """
     doc = pymupdf.open(pdf_path)
     out: list[PageRecord] = []
     for page_num, page in enumerate(doc, start=1):
@@ -136,6 +214,7 @@ def index_pdf(pdf_path: Path, dpi: int = 250) -> list[PageRecord]:
                 status = "unknown"  # decoded something but format didn't match
         out.append(PageRecord(page_num, cls, name, pip, tot, text, status))
     doc.close()
+    _apply_overrides(out, load_sidecar_overrides(pdf_path))
     return out
 
 

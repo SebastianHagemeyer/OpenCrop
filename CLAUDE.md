@@ -32,6 +32,27 @@ Examples from `workScans/10MATD_combinedTEST.pdf`: `10MATD/Dj/1/2`, `10MATD/Ruby
 
 QR detection rate on `10MATD_combinedTEST.pdf` at 250 DPI: 47/52 plain, 52/52 with the Otsu + rescaling fallback in `_decode_qr`. If a page still can't be decoded, `_infer_missing` in `scan_index.py` assigns it from the nearest decoded neighbour (e.g. a missing page immediately followed by `X/2/2` is inferred to be `X/1/2`). Pages with no usable neighbour stay `unknown` and never produce a student folder.
 
+## Recovering orphan pages (the dialog)
+
+Inference can't bridge across a run of orphans — if Shylah tore her QR and Arvin drew over his, all four of their pages sit between Trey and Yusra with no neighbour to lean on, and they fall out as `UNKNOWN_orphan_p<N>` groups (one fake "student" per page).
+
+After **Check scan**, if any page still has `qr_status == "unknown"` the **orphan recovery dialog** (`orphan_dialog.py`) auto-opens. It shows a thumbnail of each orphan page (rendered at ~60 DPI — good enough to read the printed Name field, the teacher's title block, and most of the student's handwriting) alongside an editable combobox prefilled with rostered students not yet decoded in this scan. The teacher types or picks a first name per page; same name on multiple pages combines them into one packet in PDF order. Confirming writes a `<pdf>.qrfix.json` sidecar next to the scan:
+
+```json
+{
+  "overrides": {
+    "23": {"class": "10MATD", "name": "Arvin",  "page_in_packet": 1, "pages_total": 2},
+    "24": {"class": "10MATD", "name": "Arvin",  "page_in_packet": 2, "pages_total": 2},
+    "25": {"class": "10MATD", "name": "Shylah", "page_in_packet": 1, "pages_total": 2},
+    "26": {"class": "10MATD", "name": "Shylah", "page_in_packet": 2, "pages_total": 2}
+  }
+}
+```
+
+`scan_index.index_pdf()` reads the sidecar on every call (so extract, rescore, and any later check picks the fix up automatically). The button **Fix orphans...** re-opens the dialog without re-rendering the PDF; the launcher caches the last indexed page list for that.
+
+The roster used for the dropdown comes from `QMARK_CLASS_PATH` (an .xlsx with `Name:` in the first column — what the dashboard hands off). Missing/unreadable roster → the combobox stays freely typable, no choices listed. The sidecar is the user-editable source of truth — delete or hand-edit the file to undo or tweak recoveries.
+
 ## Output folder schema (what the marker iterates over)
 
 ```

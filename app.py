@@ -33,8 +33,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from orphan_dialog import OrphanRecoveryDialog
 from qmark_theme import apply_qmark_theme
-from scan_index import group_into_students, index_pdf
+from scan_index import (
+    _apply_overrides,
+    group_into_students,
+    index_pdf,
+    save_sidecar_overrides,
+)
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_PDF_REL = Path("workScans/10MATD_combinedTEST.pdf")
@@ -49,6 +55,10 @@ QMARK_CLASS_NAME = os.environ.get("QMARK_CLASS_NAME", "").strip()
 # every student crop as attempted/unattempted/borderline — see attempts.csv
 # under each exam's output folder.
 QMARK_SHEET_PATH = os.environ.get("QMARK_SHEET_PATH", "").strip()
+# Class roster xlsx supplied by the dashboard. Used by the orphan
+# recovery dialog to populate the student-name dropdown with the names
+# that the QR pipeline didn't pick up for this scan.
+QMARK_CLASS_PATH = os.environ.get("QMARK_CLASS_PATH", "").strip()
 
 
 def _qmark_output_name() -> str:
@@ -90,6 +100,7 @@ class Launcher(QMainWindow):
     log_signal = Signal(str)
     busy_signal = Signal(bool, str)
     tpl_path_signal = Signal(str)
+    pages_indexed_signal = Signal(object)  # carries list[PageRecord]
 
     def __init__(self) -> None:
         super().__init__()
@@ -99,10 +110,17 @@ class Launcher(QMainWindow):
         self.resize(820, 540)
         self.setMinimumSize(640, 360)
 
+        # Cached page list from the last Check scan run, used to
+        # populate the orphan recovery dialog without re-rendering
+        # the PDF (~30s for 32 pages).
+        self._last_pages = None
+        self._last_pdf: Path | None = None
+
         self._build()
         self.log_signal.connect(self._append_log)
         self.busy_signal.connect(self._set_busy)
         self.tpl_path_signal.connect(self.tpl_edit.setText)
+        self.pages_indexed_signal.connect(self._on_pages_indexed)
 
         default_pdf = HERE / DEFAULT_PDF_REL
         if default_pdf.exists():
@@ -164,13 +182,21 @@ class Launcher(QMainWindow):
         actions = QHBoxLayout()
         self.btn_check = QPushButton("1. Check scan")
         self.btn_check.clicked.connect(self._check_scan)
+        self.btn_fix = QPushButton("Fix orphans...")
+        self.btn_fix.clicked.connect(self._open_orphan_dialog)
+        self.btn_fix.setEnabled(False)
+        self.btn_fix.setToolTip(
+            "Manually assign students to pages whose QR couldn't be "
+            "read (torn paper, drawn-over QR, etc). Enabled after "
+            "Check scan finds at least one orphan page."
+        )
         self.btn_define = QPushButton("2. Define regions")
         self.btn_define.clicked.connect(self._define_regions)
         self.btn_extract = QPushButton("3. Extract crops")
         self.btn_extract.clicked.connect(self._extract)
         self.btn_open = QPushButton("Open output folder")
         self.btn_open.clicked.connect(self._open_output)
-        for b in (self.btn_check, self.btn_define, self.btn_extract, self.btn_open):
+        for b in (self.btn_check, self.btn_fix, self.btn_define, self.btn_extract, self.btn_open):
             actions.addWidget(b)
         self.skip_existing_cb = QCheckBox("Skip students already in manifest")
         self.skip_existing_cb.setToolTip(
@@ -212,7 +238,16 @@ class Launcher(QMainWindow):
     def _set_busy(self, busy: bool, label: str = "") -> None:
         for b in (self.btn_check, self.btn_define, self.btn_extract):
             b.setEnabled(not busy)
+        # Fix-orphans button is only meaningful after a Check scan
+        # surfaced at least one orphan; honour that state instead of
+        # blindly re-enabling here.
+        self.btn_fix.setEnabled((not busy) and self._has_orphans())
         self.status.showMessage(label if busy else "Ready.")
+
+    def _has_orphans(self) -> bool:
+        if not self._last_pages:
+            return False
+        return any(p.qr_status == "unknown" for p in self._last_pages)
 
     def _pdf_path(self) -> Path | None:
         s = self.pdf_edit.text().strip()
@@ -333,24 +368,75 @@ class Launcher(QMainWindow):
         def work() -> None:
             try:
                 pages = index_pdf(pdf)
-                groups = group_into_students(pages)
-                lines = [
-                    f"Indexed {len(pages)} pages -> {len(groups)} student groups",
-                    "",
-                    f"{'group':<28} {'n':>3}  {'pdf pages':<25}  status",
-                    "-" * 78,
-                ]
-                for g in groups:
-                    pdf_pgs = ",".join(str(p.pdf_page_number) for p in g.pages)
-                    statuses = ",".join(p.qr_status[:4] for p in g.pages)
-                    lines.append(f"{g.folder_name:<28} {len(g.pages):>3}  {pdf_pgs:<25}  {statuses}")
-                self.log_signal.emit("\n".join(lines) + "\n")
+                self._log_groups(pages)
+                # Hand the page list back to the UI thread so the orphan
+                # dialog can reuse it (re-rendering every page is slow).
+                self.pages_indexed_signal.emit((pdf, pages))
             except Exception as e:
                 self.log_signal.emit(f"ERROR: {e}\n")
             finally:
                 self.busy_signal.emit(False, "")
 
         self._run_in_thread(work)
+
+    def _log_groups(self, pages) -> None:
+        """Render the standard groups-table for the log panel."""
+        groups = group_into_students(pages)
+        lines = [
+            f"Indexed {len(pages)} pages -> {len(groups)} student groups",
+            "",
+            f"{'group':<28} {'n':>3}  {'pdf pages':<25}  status",
+            "-" * 78,
+        ]
+        for g in groups:
+            pdf_pgs = ",".join(str(p.pdf_page_number) for p in g.pages)
+            statuses = ",".join(p.qr_status[:4] for p in g.pages)
+            lines.append(f"{g.folder_name:<28} {len(g.pages):>3}  {pdf_pgs:<25}  {statuses}")
+        self.log_signal.emit("\n".join(lines) + "\n")
+
+    def _on_pages_indexed(self, payload) -> None:
+        """UI-thread handler: cache page list + auto-pop dialog if needed."""
+        pdf, pages = payload
+        self._last_pdf = pdf
+        self._last_pages = pages
+        self.btn_fix.setEnabled(self._has_orphans())
+        if self._has_orphans():
+            self._open_orphan_dialog()
+
+    def _open_orphan_dialog(self) -> None:
+        if not self._last_pages or not self._last_pdf:
+            QMessageBox.information(
+                self,
+                "Nothing to recover",
+                "Run Check scan first — the dialog needs the indexed page list.",
+            )
+            return
+        if not self._has_orphans():
+            QMessageBox.information(
+                self,
+                "No orphans",
+                "Every page in this scan was matched to a student. Nothing to recover.",
+            )
+            return
+
+        roster = Path(QMARK_CLASS_PATH) if QMARK_CLASS_PATH else None
+        dlg = OrphanRecoveryDialog(
+            self._last_pdf,
+            self._last_pages,
+            class_hint=QMARK_CLASS_NAME,
+            roster_path=roster,
+            parent=self,
+        )
+        if dlg.exec() != dlg.Accepted or not dlg.selections:
+            self._append_log("Recovery dialog cancelled — orphans left as-is.\n")
+            return
+
+        sidecar = save_sidecar_overrides(self._last_pdf, dlg.selections)
+        _apply_overrides(self._last_pages, dlg.selections)
+        self._append_log(f"Saved {len(dlg.selections)} override(s) -> {sidecar.name}")
+        self._log_groups(self._last_pages)
+        # Refresh button state — overrides may have cleared every orphan.
+        self.btn_fix.setEnabled(self._has_orphans())
 
     # ---------- stage 2: define regions ----------
 
