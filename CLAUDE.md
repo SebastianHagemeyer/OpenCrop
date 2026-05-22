@@ -59,6 +59,18 @@ After **Check scan**, if any page still has `qr_status == "unknown"` the **orpha
 
 The roster used for the dropdown comes from `QMARK_CLASS_PATH` (an .xlsx with `Name:` in the first column — what the dashboard hands off). Missing/unreadable roster → the combobox stays freely typable, no choices listed. The sidecar is the user-editable source of truth — delete or hand-edit the file to undo or tweak recoveries.
 
+## Extract reuses the scan cache (and auto-Checks if missing)
+
+`extract.extract()` accepts a `cached_pages: list[PageRecord] | None` kwarg. When the launcher passes its `_last_pages` through, extract skips `index_pdf` entirely — same ~70s → instant win as the region editor cache. The CLI path (`python extract.py …`) is unaffected: no kwarg → fall back to indexing.
+
+The launcher's `_extract` is a request-then-resume flow now:
+
+1. Gather params (template, exam name, sheet PDF, checkboxes) into `self._pending_extract`.
+2. If `_last_pdf == pdf` and `_last_pages is not None`: skip straight to `_resume_pending_extract`.
+3. Otherwise: log "No scan cached — running Check scan first" and trigger `_check_scan`. The standard `_on_pages_indexed` handler notices the pending request and hands off to `_resume_pending_extract` instead of auto-popping the orphan dialog (so the user isn't prompted twice for the same orphans).
+4. `_resume_pending_extract`: if any orphans remain, show a 3-button dialog (`Resolve now…` / `Extract anyway` / `Cancel`). `Resolve now…` opens the recovery dialog; whatever's left after that just flows through as `orphan_pXX/` folders (single-prompt rule — no nagging the user with a second confirmation).
+5. Spawn the extract worker thread with `cached_pages` set.
+
 ## Region editor reuses the scan cache
 
 The launcher caches the post-`index_pdf` page list on `self._last_pages` after Check scan finishes. When the user clicks **Define regions** for the same PDF, the launcher passes that list through as `TemplateEditor(pdf, cached_pages=...)`. The editor short-circuits its own streaming decoder (which re-renders every page at `INDEX_DPI`) and bootstraps from the cached groups in ~300ms instead of ~30–70s. Since `_last_pages` already carries any sidecar overrides, recovered students appear in the reference-student dropdown too. Opening a different PDF later via the editor's "Open PDF..." button still falls back to the streaming path — the cache only fires on the first `_load_pdf` call after construction.

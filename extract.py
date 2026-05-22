@@ -35,7 +35,7 @@ import numpy as np
 import pymupdf
 import yaml
 
-from scan_index import StudentGroup, group_into_students, index_pdf
+from scan_index import PageRecord, StudentGroup, group_into_students, index_pdf
 
 EXTRACT_DPI = 300
 
@@ -437,6 +437,7 @@ def extract(
     sheet_pdf: Path | None = None,
     skip_existing: bool = False,
     include_mc_pages: bool = True,
+    cached_pages: list[PageRecord] | None = None,
 ) -> None:
     template = yaml.safe_load(template_path.read_text(encoding="utf-8"))
     pages_per_student: int = template["pages_per_student"]
@@ -464,8 +465,12 @@ def extract(
     for q in questions:
         qs_by_page.setdefault(q["page"], []).append(q)
 
-    print(f"Indexing {pdf_path.name}...")
-    pages = index_pdf(pdf_path)
+    if cached_pages is not None:
+        print(f"Reusing cached scan for {pdf_path.name} ({len(cached_pages)} pages).")
+        pages = cached_pages
+    else:
+        print(f"Indexing {pdf_path.name}...")
+        pages = index_pdf(pdf_path)
     groups = group_into_students(pages)
     print(f"  {len(groups)} student groups, {sum(len(g.pages) for g in groups)} pages")
 

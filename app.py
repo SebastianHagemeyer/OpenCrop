@@ -118,6 +118,11 @@ class Launcher(QMainWindow):
         # the PDF (~30s for 32 pages).
         self._last_pages = None
         self._last_pdf: Path | None = None
+        # When Extract is clicked but no scan cache exists for the
+        # current PDF, we stash the extract parameters here, kick off
+        # Check scan, and resume after _on_pages_indexed fires. None
+        # means no pending extract.
+        self._pending_extract: dict | None = None
 
         self._build()
         self.log_signal.connect(self._append_log)
@@ -424,7 +429,12 @@ class Launcher(QMainWindow):
             msg += f"  ({n_orphan} orphan page{'s' if n_orphan != 1 else ''} need a name)"
         self._append_log(msg)
         self.btn_fix.setEnabled(n_orphan > 0)
-        if n_orphan > 0:
+        # If Extract is waiting on this scan, hand off — it owns the
+        # orphan prompt for that path so we don't double-prompt the
+        # user. Otherwise standalone Check auto-pops the dialog.
+        if self._pending_extract is not None and self._pending_extract.get("pdf") == pdf:
+            self._resume_pending_extract()
+        elif n_orphan > 0:
             self._open_orphan_dialog()
 
     def _open_orphan_dialog(self) -> None:
@@ -570,12 +580,120 @@ class Launcher(QMainWindow):
             )
             return
 
+        sheet_pdf: Path | None = None
+        sheet_str = self.sheet_edit.text().strip()
+        if sheet_str:
+            candidate = Path(sheet_str)
+            if not candidate.is_absolute():
+                candidate = (HERE / candidate).resolve()
+            if candidate.exists():
+                sheet_pdf = candidate
+            else:
+                self._append_log(
+                    f"WARNING: Sheet PDF {candidate} not found; "
+                    "attempt detection disabled."
+                )
+
         OUTPUT_DIR.mkdir(exist_ok=True)
+
+        # Stash everything we need to run extract; either run now (if
+        # we have a fresh scan cache) or queue it behind Check scan.
+        self._pending_extract = {
+            "pdf": pdf,
+            "tpl": tpl,
+            "exam_name": exam_name,
+            "sheet_pdf": sheet_pdf,
+            "skip_existing": self.skip_existing_cb.isChecked(),
+            "include_mc_pages": self.include_mc_cb.isChecked(),
+        }
+
+        if self._last_pdf == pdf and self._last_pages is not None:
+            # Cache for this PDF is fresh — go straight to the orphan
+            # check and worker thread.
+            self._resume_pending_extract()
+            return
+
+        # No cache (or cache is for a different PDF). Index this PDF
+        # first; _on_pages_indexed will call _resume_pending_extract.
+        self._append_log(
+            "No scan cached for this PDF — running Check scan first."
+        )
+        self._check_scan()
+
+    def _resume_pending_extract(self) -> None:
+        """After Check scan has run, finish the queued extract request.
+
+        Pops a prompt if orphans remain, then spawns the worker thread
+        with cached_pages so extract.py skips re-indexing.
+        """
+        params = self._pending_extract
+        if params is None:
+            return
+        pdf = params["pdf"]
+        if self._last_pdf != pdf or self._last_pages is None:
+            # Shouldn't happen, but bail rather than extract a stale PDF.
+            self._pending_extract = None
+            self._set_busy(False, "")
+            return
+
+        # Orphan gate: if any pages still aren't matched to a student,
+        # surface the choice rather than silently writing orphan_pXX
+        # folders.
+        if self._has_orphans():
+            box = QMessageBox(self)
+            box.setWindowTitle("Unmatched pages")
+            box.setIcon(QMessageBox.Warning)
+            n_orphan = sum(1 for p in self._last_pages if p.qr_status == "unknown")
+            box.setText(
+                f"<b>{n_orphan} page(s) in this scan still aren't matched "
+                f"to a student.</b>"
+            )
+            box.setInformativeText(
+                "Extract them anyway (one orphan_p&lt;N&gt; folder per "
+                "stray page), or resolve them now via the recovery "
+                "dialog?"
+            )
+            resolve_btn = box.addButton("Resolve now…", QMessageBox.AcceptRole)
+            anyway_btn = box.addButton("Extract anyway", QMessageBox.DestructiveRole)
+            cancel_btn = box.addButton(QMessageBox.Cancel)
+            box.setDefaultButton(resolve_btn)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is cancel_btn:
+                self._pending_extract = None
+                self._append_log("Extract cancelled.")
+                self._set_busy(False, "")
+                return
+            if clicked is resolve_btn:
+                self._open_orphan_dialog()
+                # User may have skipped some; we don't re-prompt — if
+                # any orphans remain, we just proceed and they fall
+                # through as orphan_pXX folders. The single-prompt
+                # rule keeps the flow predictable.
+
+        # Spawn the actual extraction. The work runs off the UI thread
+        # because extract.py is CPU-heavy (PDF render + cv2 per crop).
+        self._pending_extract = None
         self._set_busy(True, "Extracting crops...")
-        self._append_log(f"\n=== Extracting {pdf.name} with {tpl.name} -> output/{exam_name} ===")
+        self._append_log(
+            f"=== Extracting {pdf.name} with {params['tpl'].name} "
+            f"-> output/{params['exam_name']} ==="
+        )
+        if params["sheet_pdf"]:
+            self._append_log(f"Blank reference: {params['sheet_pdf']}")
+        else:
+            self._append_log(
+                "No Sheet PDF — attempt detection disabled "
+                "(no _blank/ or attempts.csv will be written)."
+            )
+        if params["skip_existing"]:
+            self._append_log("Skip-existing: on.")
+        if not params["include_mc_pages"]:
+            self._append_log("Include MC pages: off.")
 
         log_signal = self.log_signal
         busy_signal = self.busy_signal
+        cached_pages = self._last_pages
 
         class _LogStream(io.TextIOBase):
             def write(self, s: str) -> int:
@@ -586,46 +704,18 @@ class Launcher(QMainWindow):
             def flush(self) -> None:
                 pass
 
-        sheet_pdf: Path | None = None
-        sheet_str = self.sheet_edit.text().strip()
-        if sheet_str:
-            candidate = Path(sheet_str)
-            if not candidate.is_absolute():
-                candidate = (HERE / candidate).resolve()
-            if candidate.exists():
-                sheet_pdf = candidate
-                self._append_log(f"Blank reference: {candidate}")
-            else:
-                self._append_log(
-                    f"WARNING: Sheet PDF {candidate} not found; "
-                    "attempt detection disabled."
-                )
-        else:
-            self._append_log(
-                "No Sheet PDF — attempt detection disabled "
-                "(no _blank/ or attempts.csv will be written)."
-            )
-
-        skip_existing = self.skip_existing_cb.isChecked()
-        if skip_existing:
-            self._append_log("Skip-existing: on (students already in manifest.csv will be left alone).")
-        include_mc_pages = self.include_mc_cb.isChecked()
-        if not include_mc_pages:
-            self._append_log(
-                "Include MC pages: off (any mc_pages in the template will be ignored)."
-            )
-
         def work() -> None:
             try:
                 from extract import extract as run_extract
 
                 with contextlib.redirect_stdout(_LogStream()):
                     run_extract(
-                        pdf, tpl, OUTPUT_DIR, dpi=300,
-                        exam_name_override=exam_name,
-                        sheet_pdf=sheet_pdf,
-                        skip_existing=skip_existing,
-                        include_mc_pages=include_mc_pages,
+                        pdf, params["tpl"], OUTPUT_DIR, dpi=300,
+                        exam_name_override=params["exam_name"],
+                        sheet_pdf=params["sheet_pdf"],
+                        skip_existing=params["skip_existing"],
+                        include_mc_pages=params["include_mc_pages"],
+                        cached_pages=cached_pages,
                     )
                 log_signal.emit("Extract finished.\n")
             except SystemExit as e:
