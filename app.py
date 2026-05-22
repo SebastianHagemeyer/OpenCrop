@@ -36,12 +36,15 @@ from PySide6.QtWidgets import (
 )
 
 from orphan_dialog import OrphanRecoveryDialog
+from page_viewer import PageViewerDialog
 from qmark_theme import apply_qmark_theme
 from scan_index import (
     _apply_overrides,
     group_into_students,
     index_pdf,
+    load_skipped_students,
     save_sidecar_overrides,
+    save_skipped_students,
 )
 from scan_view import ScanResultView
 
@@ -233,6 +236,8 @@ class Launcher(QMainWindow):
         split = QSplitter(Qt.Vertical)
         self.scan_view = ScanResultView()
         self.scan_view.resolve_clicked.connect(self._open_orphan_dialog)
+        self.scan_view.view_pages_requested.connect(self._view_pages_for)
+        self.scan_view.skip_toggled.connect(self._toggle_skip)
         split.addWidget(self.scan_view)
 
         self.log = QPlainTextEdit()
@@ -406,7 +411,37 @@ class Launcher(QMainWindow):
         if self._last_pages is None:
             self.scan_view.clear()
             return
-        self.scan_view.set_pages(self._last_pages)
+        skipped = load_skipped_students(self._last_pdf) if self._last_pdf else set()
+        self.scan_view.set_pages(self._last_pages, skipped=skipped)
+
+    def _view_pages_for(self, folder_name: str) -> None:
+        """Open the page-viewer dialog for one roster row."""
+        if not self._last_pdf or not self._last_pages:
+            return
+        groups = group_into_students(self._last_pages)
+        match = next((g for g in groups if g.folder_name == folder_name), None)
+        if match is None:
+            return
+        page_nums = [p.pdf_page_number for p in match.pages]
+        dlg = PageViewerDialog(
+            self._last_pdf, page_nums, title=match.student_name, parent=self,
+        )
+        dlg.exec()
+
+    def _toggle_skip(self, folder_name: str, skip: bool) -> None:
+        """Right-click → Skip from extraction (or undo)."""
+        if not self._last_pdf:
+            return
+        current = load_skipped_students(self._last_pdf)
+        if skip:
+            current.add(folder_name)
+            verb = "Skipping"
+        else:
+            current.discard(folder_name)
+            verb = "Including"
+        save_skipped_students(self._last_pdf, current)
+        self._append_log(f"{verb} {folder_name} (extraction).")
+        self._refresh_view()
 
     def _summarize_pages(self, pages) -> tuple[int, int]:
         """Return (n_students, n_orphan_pages) without mutating pages

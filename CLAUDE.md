@@ -59,6 +59,28 @@ After **Check scan**, if any page still has `qr_status == "unknown"` the **orpha
 
 The roster used for the dropdown comes from `QMARK_CLASS_PATH` (an .xlsx with `Name:` in the first column — what the dashboard hands off). Missing/unreadable roster → the combobox stays freely typable, no choices listed. The sidecar is the user-editable source of truth — delete or hand-edit the file to undo or tweak recoveries.
 
+Each row also has a **Packet page** spinbox. Default value is the row's PDF-order index (row 1 → 1, row 2 → 2, …), so the historical behaviour is the default. The spinner lets the teacher override when pages were handed in out of order (e.g. a 2-page packet where the student stapled them in reverse). On Apply, pages for the same student are grouped by name and sorted by the spinbox values; duplicate packet pages for one name trigger a warning instead of silently overwriting an override. `pages_total` is set to `max(packet_page)` per name, so a sparse claim (1 and 3 with no 2) is allowed — the teacher knows their data.
+
+## Skip / view from the roster (right-click)
+
+Right-clicking a student row in `ScanResultView` opens a small menu:
+
+- **View pages...** (also bound to double-click) opens `PageViewerDialog` — a horizontal strip of low-DPI thumbnails for every PDF page in that student's packet. Useful for confirming a recovered student really is who you think they are, or spotting a mis-grouping before extract.
+- **Skip from extraction** / **Include in extraction** toggles whether the student is excluded. Skipped rows render strikethrough + grey + a `skipped — <status>` label, and the header counts them separately (e.g. `10MATD — 18 students, 2 skipped`).
+
+Skip state lives in the same `<pdf>.qrfix.json` sidecar as the recovery overrides, under a `skipped_students` array of folder_names:
+
+```json
+{
+  "overrides": { ... },
+  "skipped_students": ["10MATG_Jamie", "10MATG_Jordan"]
+}
+```
+
+`extract.extract()` calls `load_skipped_students(pdf_path)` directly (not via the launcher), so the skip is honoured by the CLI too. The sidecar is deleted automatically when both `overrides` and `skipped_students` are empty, keeping the data directory clean when the teacher undoes everything.
+
+Primary use case: scanning two classes' worth of papers in one PDF, then skipping the wrong-class students for *this* extract run. Toggle them back in later for the other class's extract.
+
 ## Extract reuses the scan cache (and auto-Checks if missing)
 
 `extract.extract()` accepts a `cached_pages: list[PageRecord] | None` kwarg. When the launcher passes its `_last_pages` through, extract skips `index_pdf` entirely — same ~70s → instant win as the region editor cache. The CLI path (`python extract.py …`) is unaffected: no kwarg → fall back to indexing.

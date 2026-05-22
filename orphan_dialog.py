@@ -27,7 +27,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QScrollArea,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -103,9 +105,10 @@ def _decoded_names(pages: list[PageRecord]) -> set[str]:
 
 
 class _OrphanRow(QWidget):
-    """One row: thumbnail + page label + student name combobox."""
+    """One row: thumbnail + page label + student name + packet page spinner."""
 
-    def __init__(self, page_number: int, thumb: QPixmap, name_choices: list[str]) -> None:
+    def __init__(self, page_number: int, default_packet_page: int,
+                 thumb: QPixmap, name_choices: list[str]) -> None:
         super().__init__()
         self.page_number = page_number
 
@@ -122,6 +125,7 @@ class _OrphanRow(QWidget):
         right = QVBoxLayout()
         right.setSpacing(6)
         right.addWidget(QLabel(f"<b>PDF page {page_number}</b>"))
+
         right.addWidget(QLabel("Student first name:"))
         self.name_cb = QComboBox()
         self.name_cb.setEditable(True)
@@ -130,15 +134,35 @@ class _OrphanRow(QWidget):
             self.name_cb.addItem(n)
         self.name_cb.setMinimumWidth(220)
         right.addWidget(self.name_cb)
+
+        # Packet page picker: when the same student appears on multiple
+        # rows, the spinbox tells us which page goes first inside the
+        # packet. Default is PDF order (row 1 = packet page 1, row 2 = 2,
+        # ...), so the existing behaviour is the default; the spinner is
+        # only needed when pages were handed in out of order.
+        page_row = QHBoxLayout()
+        page_row.addWidget(QLabel("Packet page:"))
+        self.packet_sb = QSpinBox()
+        self.packet_sb.setRange(1, 9)
+        self.packet_sb.setValue(default_packet_page)
+        self.packet_sb.setMaximumWidth(70)
+        page_row.addWidget(self.packet_sb)
+        page_row.addStretch(1)
+        right.addLayout(page_row)
+
         right.addWidget(QLabel(
-            "<i>Leave blank to keep this page as an orphan. Same name<br>"
-            "on multiple pages combines them into one packet (in PDF order).</i>"
+            "<i>Leave name blank to keep this page as an orphan. Same name<br>"
+            "on multiple pages combines them into one packet, sorted by<br>"
+            "the packet-page values you set above.</i>"
         ))
         right.addStretch(1)
         row.addLayout(right, 1)
 
     def chosen_name(self) -> str:
         return self.name_cb.currentText().strip()
+
+    def packet_page(self) -> int:
+        return self.packet_sb.value()
 
 
 class OrphanRecoveryDialog(QDialog):
@@ -197,9 +221,9 @@ class OrphanRecoveryDialog(QDialog):
             scroll_layout = QVBoxLayout(scroll_inner)
             scroll_layout.setContentsMargins(4, 4, 4, 4)
             scroll_layout.setSpacing(8)
-            for p in self._orphans:
+            for idx, p in enumerate(self._orphans, start=1):
                 thumb = _render_thumbnail(doc, p.pdf_page_number)
-                row = _OrphanRow(p.pdf_page_number, thumb, suggestions)
+                row = _OrphanRow(p.pdf_page_number, idx, thumb, suggestions)
                 scroll_layout.addWidget(row)
                 self._rows.append(row)
             scroll_layout.addStretch(1)
@@ -223,26 +247,42 @@ class OrphanRecoveryDialog(QDialog):
             self.class_edit.setFocus()
             return
 
-        # First pass: collect (page_number, name) for any non-blank row.
-        by_name: dict[str, list[int]] = {}
+        # Collect (name, packet_page, pdf_page) for every named row.
+        by_name: dict[str, list[tuple[int, int]]] = {}
         for row in self._rows:
             name = row.chosen_name()
             if not name:
                 continue
-            by_name.setdefault(name, []).append(row.page_number)
+            by_name.setdefault(name, []).append((row.packet_page(), row.page_number))
 
-        # Second pass: sort each name's pages by PDF order, then issue
-        # 1-based packet positions.
+        # Validate: a student can't have two pages claiming the same
+        # packet position. Surface that as an actionable warning rather
+        # than silently overwriting the override.
+        for name, entries in by_name.items():
+            pps = [pp for pp, _ in entries]
+            if len(pps) != len(set(pps)):
+                QMessageBox.warning(
+                    self,
+                    "Duplicate packet page",
+                    f"<b>{name}</b> has two pages set to the same packet "
+                    "position. Each page in a student's packet needs a "
+                    "unique packet-page number — adjust the spinner on "
+                    "the conflicting rows.",
+                )
+                return
+
+        # pages_total = max packet-page picked for that name. Allows a
+        # single-page packet (everyone at 1) or a sparse one (1 and 3
+        # with no 2) — the teacher knows their data better than we do.
         selections: dict[int, dict] = {}
-        for name, page_nums in by_name.items():
-            page_nums.sort()
-            total = len(page_nums)
-            for idx, pn in enumerate(page_nums, start=1):
+        for name, entries in by_name.items():
+            pages_total = max(pp for pp, _ in entries)
+            for pp, pn in entries:
                 selections[pn] = {
                     "class": cls,
                     "name": name,
-                    "page_in_packet": idx,
-                    "pages_total": total,
+                    "page_in_packet": pp,
+                    "pages_total": pages_total,
                 }
         self.selections = selections
         self.accept()

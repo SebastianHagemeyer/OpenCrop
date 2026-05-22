@@ -158,10 +158,62 @@ def save_sidecar_overrides(pdf_path: Path, overrides: dict[int, dict]) -> Path:
     """Write the recovery dialog's overrides next to the scan PDF.
 
     Keys must be 1-based PDF page numbers (ints). Returns the path
-    written. Overwrites any existing sidecar.
+    written. Preserves any existing ``skipped_students`` list so the
+    user's skip choices survive a recovery edit.
     """
     p = sidecar_overrides_path(pdf_path)
-    blob = {"overrides": {str(k): v for k, v in overrides.items()}}
+    existing_skip = load_skipped_students(pdf_path)
+    blob: dict = {"overrides": {str(k): v for k, v in overrides.items()}}
+    if existing_skip:
+        blob["skipped_students"] = sorted(existing_skip)
+    with p.open("w", encoding="utf-8") as f:
+        json.dump(blob, f, indent=2, sort_keys=True)
+    return p
+
+
+def load_skipped_students(pdf_path: Path) -> set[str]:
+    """Per-scan list of student folder_names the teacher excluded.
+
+    Stored on disk under the same ``<pdf>.qrfix.json`` sidecar as the
+    recovery overrides (one file per scan keeps related state together).
+    Returns an empty set when the file is missing or malformed.
+    """
+    p = sidecar_overrides_path(pdf_path)
+    if not p.is_file():
+        return set()
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            blob = json.load(f)
+    except (OSError, ValueError):
+        return set()
+    raw = blob.get("skipped_students") or []
+    return {str(s) for s in raw if isinstance(s, str) and s.strip()}
+
+
+def save_skipped_students(pdf_path: Path, skipped: set[str]) -> Path:
+    """Persist the teacher's skip choices.
+
+    Read-modify-write so we don't blow away the recovery overrides
+    sitting in the same sidecar.
+    """
+    p = sidecar_overrides_path(pdf_path)
+    blob: dict = {}
+    if p.is_file():
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                blob = json.load(f) or {}
+        except (OSError, ValueError):
+            blob = {}
+    if skipped:
+        blob["skipped_students"] = sorted(skipped)
+    else:
+        blob.pop("skipped_students", None)
+    # Drop the sidecar entirely if nothing remains (keeps the data
+    # directory clean when the teacher undoes every override + skip).
+    if not blob.get("overrides") and not blob.get("skipped_students"):
+        if p.is_file():
+            p.unlink()
+        return p
     with p.open("w", encoding="utf-8") as f:
         json.dump(blob, f, indent=2, sort_keys=True)
     return p

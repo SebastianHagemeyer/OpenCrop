@@ -35,7 +35,10 @@ import numpy as np
 import pymupdf
 import yaml
 
-from scan_index import PageRecord, StudentGroup, group_into_students, index_pdf
+from scan_index import (
+    PageRecord, StudentGroup, group_into_students, index_pdf,
+    load_skipped_students,
+)
 
 EXTRACT_DPI = 300
 
@@ -474,6 +477,13 @@ def extract(
     groups = group_into_students(pages)
     print(f"  {len(groups)} student groups, {sum(len(g.pages) for g in groups)} pages")
 
+    # User-skipped students (e.g. when the scan mixes two classes and
+    # the teacher only wants one extracted this run). Sidecar-managed,
+    # so the skip survives between launches.
+    user_skipped = load_skipped_students(pdf_path)
+    if user_skipped:
+        print(f"  user-skipped: {len(user_skipped)} student(s) (sidecar)")
+
     exam_out = output_dir / exam_name
     exam_out.mkdir(parents=True, exist_ok=True)
     manifest_path = exam_out / MANIFEST_CSV_NAME
@@ -515,6 +525,9 @@ def extract(
     )
     print(f"\nExtracting {len(questions)} questions per student{mc_suffix} at {dpi} DPI...")
     for group in groups:
+        if group.folder_name in user_skipped:
+            print(f"  [SKIP] {group.folder_name:<28} (excluded by user)")
+            continue
         if group.folder_name in skipped_folders:
             print(f"  [SKIP] {group.folder_name:<28} (already in manifest)")
             continue
