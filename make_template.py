@@ -46,7 +46,7 @@ def _code_for(n: int) -> str:
 import numpy as np
 import pymupdf
 import yaml
-from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtCore import QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -239,7 +239,8 @@ class TemplateEditor(QMainWindow):
     # (token, pdf_path, groups, done, page_num, total_pages)
     _index_failed = Signal(int, str)         # (token, error)
 
-    def __init__(self, pdf_path: Path) -> None:
+    def __init__(self, pdf_path: Path,
+                 cached_pages: list[PageRecord] | None = None) -> None:
         super().__init__()
         self.pdf_path = pdf_path
         self.setWindowTitle(f"Template editor — {self.pdf_path.name}")
@@ -258,6 +259,12 @@ class TemplateEditor(QMainWindow):
         self.mc_pages: set[int] = set()
         self.next_q_num = 1
         self._index_token = 0
+        # When the Launcher already indexed the PDF for "Check scan", it
+        # hands the page list through so we skip the streaming decoder
+        # (~30s for 32 pages) and bootstrap straight from the cache.
+        # Consumed on the first _load_pdf call; re-opening a different
+        # PDF via "Open PDF..." falls back to streaming as before.
+        self._cached_pages = cached_pages
 
 
         self._build_ui()
@@ -381,6 +388,24 @@ class TemplateEditor(QMainWindow):
         self.setWindowTitle(f"Template editor — {path.name}  (indexing…)")
         self._set_busy(True)
         self.page_label.setText("Indexing pages and decoding QR codes…")
+
+        # Launcher-fed cache: short-circuit the per-page decode and
+        # bootstrap from groups we already have. Only the FIRST load
+        # gets this — opening a different PDF later re-streams from
+        # scratch since the cache no longer applies.
+        cached = self._cached_pages
+        self._cached_pages = None
+        if cached:
+            snapshot = [dataclasses.replace(r) for r in cached]
+            groups = [g for g in group_into_students(snapshot)
+                      if g.student_class != "UNKNOWN"]
+            total = len(snapshot)
+            # Defer to the next event-loop tick so signal connections
+            # (and the freshly-built UI) are settled before we paint.
+            QTimer.singleShot(0, lambda: self._on_groups_updated(
+                token, str(path), groups, True, total, total,
+            ))
+            return
 
         def work() -> None:
             try:

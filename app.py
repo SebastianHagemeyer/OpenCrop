@@ -20,6 +20,7 @@ from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSplitter,
     QStatusBar,
     QVBoxLayout,
     QWidget,
@@ -41,6 +43,7 @@ from scan_index import (
     index_pdf,
     save_sidecar_overrides,
 )
+from scan_view import ScanResultView
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_PDF_REL = Path("workScans/10MATD_combinedTEST.pdf")
@@ -218,11 +221,26 @@ class Launcher(QMainWindow):
         actions.addStretch(1)
         outer.addLayout(actions)
 
+        # Roster (top) + log (bottom) split: the roster is the primary
+        # surface so a teacher can see the class at a glance instead of
+        # parsing a debug dump; the log stays around for messages and
+        # extract output but takes the smaller share by default.
+        split = QSplitter(Qt.Vertical)
+        self.scan_view = ScanResultView()
+        self.scan_view.resolve_clicked.connect(self._open_orphan_dialog)
+        split.addWidget(self.scan_view)
+
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.log.setFont(QFont("Consolas", 10))
-        outer.addWidget(self.log, 1)
+        self.log.setPlaceholderText("Messages from Check / Define / Extract will appear here.")
+        split.addWidget(self.log)
+
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 1)
+        split.setSizes([400, 140])
+        outer.addWidget(split, 1)
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -363,14 +381,13 @@ class Launcher(QMainWindow):
         if not pdf:
             return
         self._set_busy(True, "Indexing pages and decoding QRs...")
-        self._append_log(f"\n=== Checking {pdf.name} ===")
+        self._append_log(f"=== Checking {pdf.name} ===")
 
         def work() -> None:
             try:
                 pages = index_pdf(pdf)
-                self._log_groups(pages)
-                # Hand the page list back to the UI thread so the orphan
-                # dialog can reuse it (re-rendering every page is slow).
+                # Hand the page list back to the UI thread; the view and
+                # any auto-popping dialog are owned there.
                 self.pages_indexed_signal.emit((pdf, pages))
             except Exception as e:
                 self.log_signal.emit(f"ERROR: {e}\n")
@@ -379,28 +396,35 @@ class Launcher(QMainWindow):
 
         self._run_in_thread(work)
 
-    def _log_groups(self, pages) -> None:
-        """Render the standard groups-table for the log panel."""
+    def _refresh_view(self) -> None:
+        """Re-render the class roster from the cached page list."""
+        if self._last_pages is None:
+            self.scan_view.clear()
+            return
+        self.scan_view.set_pages(self._last_pages)
+
+    def _summarize_pages(self, pages) -> tuple[int, int]:
+        """Return (n_students, n_orphan_pages) without mutating pages
+        any more than group_into_students would have already."""
         groups = group_into_students(pages)
-        lines = [
-            f"Indexed {len(pages)} pages -> {len(groups)} student groups",
-            "",
-            f"{'group':<28} {'n':>3}  {'pdf pages':<25}  status",
-            "-" * 78,
-        ]
-        for g in groups:
-            pdf_pgs = ",".join(str(p.pdf_page_number) for p in g.pages)
-            statuses = ",".join(p.qr_status[:4] for p in g.pages)
-            lines.append(f"{g.folder_name:<28} {len(g.pages):>3}  {pdf_pgs:<25}  {statuses}")
-        self.log_signal.emit("\n".join(lines) + "\n")
+        n_students = sum(1 for g in groups if g.student_class != "UNKNOWN")
+        n_orphan = sum(len(g.pages) for g in groups if g.student_class == "UNKNOWN")
+        return n_students, n_orphan
 
     def _on_pages_indexed(self, payload) -> None:
-        """UI-thread handler: cache page list + auto-pop dialog if needed."""
+        """UI-thread handler: cache page list, paint roster, pop dialog if needed."""
         pdf, pages = payload
         self._last_pdf = pdf
         self._last_pages = pages
-        self.btn_fix.setEnabled(self._has_orphans())
-        if self._has_orphans():
+        self._refresh_view()
+        n_students, n_orphan = self._summarize_pages(pages)
+        msg = f"Indexed {len(pages)} pages -> {n_students} student"
+        msg += "s" if n_students != 1 else ""
+        if n_orphan:
+            msg += f"  ({n_orphan} orphan page{'s' if n_orphan != 1 else ''} need a name)"
+        self._append_log(msg)
+        self.btn_fix.setEnabled(n_orphan > 0)
+        if n_orphan > 0:
             self._open_orphan_dialog()
 
     def _open_orphan_dialog(self) -> None:
@@ -427,15 +451,36 @@ class Launcher(QMainWindow):
             roster_path=roster,
             parent=self,
         )
-        if dlg.exec() != dlg.Accepted or not dlg.selections:
-            self._append_log("Recovery dialog cancelled — orphans left as-is.\n")
+        result = dlg.exec()
+        if result != QDialog.Accepted:
+            self._append_log("Recovery dialog cancelled — orphans left as-is.")
+            return
+        if not dlg.selections:
+            self._append_log("Recovery dialog closed without naming any pages — orphans left as-is.")
             return
 
         sidecar = save_sidecar_overrides(self._last_pdf, dlg.selections)
         _apply_overrides(self._last_pages, dlg.selections)
-        self._append_log(f"Saved {len(dlg.selections)} override(s) -> {sidecar.name}")
-        self._log_groups(self._last_pages)
-        # Refresh button state — overrides may have cleared every orphan.
+
+        # Summarise what just happened — name the recovered students so
+        # the user sees the names that just landed in the roster.
+        names = sorted({s["name"] for s in dlg.selections.values() if s.get("name")})
+        n_pages = len(dlg.selections)
+        n_students = len(names)
+        names_blob = ", ".join(names) if names else "(none)"
+        self._append_log(
+            f"Recovered {n_students} student"
+            f"{'s' if n_students != 1 else ''} "
+            f"({names_blob}) from {n_pages} orphan page"
+            f"{'s' if n_pages != 1 else ''} -> saved {sidecar.name}"
+        )
+        self.status.showMessage(
+            f"Recovered {names_blob} — sidecar saved.", 6000
+        )
+
+        # Repaint the roster: the orphan banner disappears and the new
+        # students appear as rows tagged 'manual'.
+        self._refresh_view()
         self.btn_fix.setEnabled(self._has_orphans())
 
     # ---------- stage 2: define regions ----------
@@ -445,7 +490,7 @@ class Launcher(QMainWindow):
         if not pdf:
             return
         self._set_busy(True, "Region editor open — finish and close it to continue.")
-        self._append_log(f"\n=== Opening region editor on {pdf.name} ===")
+        self._append_log(f"=== Opening region editor on {pdf.name} ===")
 
         try:
             from make_template import TemplateEditor
@@ -454,8 +499,17 @@ class Launcher(QMainWindow):
             self._set_busy(False, "")
             return
 
+        # Hand the editor the page list we already indexed for Check
+        # scan (if it's for the same PDF) so it skips its own ~30s
+        # streaming decode. Cached pages already carry any sidecar
+        # recovery, so the editor sees Shylah/Arvin too.
+        cached = None
+        if self._last_pdf == pdf and self._last_pages:
+            cached = self._last_pages
+            self._append_log("Reusing cached scan from Check scan — no re-indexing needed.")
+
         try:
-            self._editor = TemplateEditor(pdf)
+            self._editor = TemplateEditor(pdf, cached_pages=cached)
         except Exception as e:
             self._append_log(f"ERROR launching editor: {e}\n")
             self._set_busy(False, "")

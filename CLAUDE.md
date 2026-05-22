@@ -32,6 +32,12 @@ Examples from `workScans/10MATD_combinedTEST.pdf`: `10MATD/Dj/1/2`, `10MATD/Ruby
 
 QR detection rate on `10MATD_combinedTEST.pdf` at 250 DPI: 47/52 plain, 52/52 with the Otsu + rescaling fallback in `_decode_qr`. If a page still can't be decoded, `_infer_missing` in `scan_index.py` assigns it from the nearest decoded neighbour (e.g. a missing page immediately followed by `X/2/2` is inferred to be `X/1/2`). Pages with no usable neighbour stay `unknown` and never produce a student folder.
 
+## Launcher view (Check scan output)
+
+The launcher's main surface is `ScanResultView` (`scan_view.py`) — a class-roster table, **not** a debug log. Each indexed student is one row: name, PDF pages, and a coloured status pill (green `decoded`, blue `inferred`, purple `manual` for sidecar overrides). The header above the table reports the dominant class and the matched-student/page totals. A small log panel sits below for one-line messages from each pipeline stage.
+
+When orphans exist, an orange banner appears above the roster — `"⚠ N page(s) couldn't be matched to a student (pages …). Click Resolve to assign them by hand."` — with a Resolve button that opens the recovery dialog. The banner is the only place orphan pages surface; they never get rendered as roster rows. After Apply, the banner disappears and the recovered students show up tagged `manual`. Make changes to the layout/colors there, not in `app.py`.
+
 ## Recovering orphan pages (the dialog)
 
 Inference can't bridge across a run of orphans — if Shylah tore her QR and Arvin drew over his, all four of their pages sit between Trey and Yusra with no neighbour to lean on, and they fall out as `UNKNOWN_orphan_p<N>` groups (one fake "student" per page).
@@ -52,6 +58,10 @@ After **Check scan**, if any page still has `qr_status == "unknown"` the **orpha
 `scan_index.index_pdf()` reads the sidecar on every call (so extract, rescore, and any later check picks the fix up automatically). The button **Fix orphans...** re-opens the dialog without re-rendering the PDF; the launcher caches the last indexed page list for that.
 
 The roster used for the dropdown comes from `QMARK_CLASS_PATH` (an .xlsx with `Name:` in the first column — what the dashboard hands off). Missing/unreadable roster → the combobox stays freely typable, no choices listed. The sidecar is the user-editable source of truth — delete or hand-edit the file to undo or tweak recoveries.
+
+## Region editor reuses the scan cache
+
+The launcher caches the post-`index_pdf` page list on `self._last_pages` after Check scan finishes. When the user clicks **Define regions** for the same PDF, the launcher passes that list through as `TemplateEditor(pdf, cached_pages=...)`. The editor short-circuits its own streaming decoder (which re-renders every page at `INDEX_DPI`) and bootstraps from the cached groups in ~300ms instead of ~30–70s. Since `_last_pages` already carries any sidecar overrides, recovered students appear in the reference-student dropdown too. Opening a different PDF later via the editor's "Open PDF..." button still falls back to the streaming path — the cache only fires on the first `_load_pdf` call after construction.
 
 ## Output folder schema (what the marker iterates over)
 
