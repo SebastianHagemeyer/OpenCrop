@@ -108,9 +108,12 @@ class _OrphanRow(QWidget):
     """One row: thumbnail + page label + student name + packet page spinner."""
 
     def __init__(self, page_number: int, default_packet_page: int,
-                 thumb: QPixmap, name_choices: list[str]) -> None:
+                 thumb: QPixmap, name_choices: list[str],
+                 preset_name: str = "",
+                 hint_text: str | None = None) -> None:
         super().__init__()
         self.page_number = page_number
+        self._preset_name = preset_name
 
         row = QHBoxLayout(self)
         row.setContentsMargins(4, 4, 4, 4)
@@ -129,10 +132,17 @@ class _OrphanRow(QWidget):
         right.addWidget(QLabel("Student first name:"))
         self.name_cb = QComboBox()
         self.name_cb.setEditable(True)
-        self.name_cb.addItem("")  # blank = skip this page
+        self.name_cb.addItem("")  # blank = clear / orphan this page
+        # Surface the preset name at the top of the dropdown if it's
+        # not already in the roster suggestions, so it stays a
+        # one-click pick after the dialog reopens.
+        if preset_name and preset_name not in name_choices:
+            self.name_cb.addItem(preset_name)
         for n in name_choices:
             self.name_cb.addItem(n)
         self.name_cb.setMinimumWidth(220)
+        if preset_name:
+            self.name_cb.setCurrentText(preset_name)
         right.addWidget(self.name_cb)
 
         # Packet page picker: when the same student appears on multiple
@@ -150,11 +160,15 @@ class _OrphanRow(QWidget):
         page_row.addStretch(1)
         right.addLayout(page_row)
 
-        right.addWidget(QLabel(
-            "<i>Leave name blank to keep this page as an orphan. Same name<br>"
-            "on multiple pages combines them into one packet, sorted by<br>"
-            "the packet-page values you set above.</i>"
-        ))
+        if hint_text is None:
+            hint_text = (
+                "Leave name blank to keep this page as an orphan. Same name "
+                "on multiple pages combines them into one packet, sorted by "
+                "the packet-page values you set above."
+            )
+        hint_lbl = QLabel(f"<i>{hint_text}</i>")
+        hint_lbl.setWordWrap(True)
+        right.addWidget(hint_lbl)
         right.addStretch(1)
         row.addLayout(right, 1)
 
@@ -163,6 +177,14 @@ class _OrphanRow(QWidget):
 
     def packet_page(self) -> int:
         return self.packet_sb.value()
+
+    def is_cleared(self) -> bool:
+        """True when the user blanked a name that started non-blank.
+
+        Used in edit mode to know which pages should drop their existing
+        override rather than just be left untouched.
+        """
+        return bool(self._preset_name) and not self.chosen_name()
 
 
 class OrphanRecoveryDialog(QDialog):
@@ -174,43 +196,82 @@ class OrphanRecoveryDialog(QDialog):
         pages: list[PageRecord],
         class_hint: str = "",
         roster_path: Path | None = None,
+        pages_to_edit: list[int] | None = None,
+        edit_title: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Recover orphan pages")
+        edit_mode = pages_to_edit is not None
+        self._edit_mode = edit_mode
+        self.setWindowTitle(edit_title or "Recover orphan pages")
         self.resize(720, 640)
 
         self._pdf_path = pdf_path
-        self._orphans = [p for p in pages if p.qr_status == "unknown"]
+        if edit_mode:
+            wanted = set(pages_to_edit or [])
+            # Preserve PDF order so packet pages and thumbnails line up
+            # with what the teacher sees in the roster.
+            self._target_pages = [p for p in pages if p.pdf_page_number in wanted]
+        else:
+            self._target_pages = [p for p in pages if p.qr_status == "unknown"]
         self._all_pages = pages
         # {pdf_page_number: override_dict}; filled in on accept.
         self.selections: dict[int, dict] = {}
+        # PDF page numbers whose existing override should be cleared
+        # (user blanked the name in edit mode). Set on accept.
+        self.cleared_pages: set[int] = set()
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(12, 12, 12, 12)
         outer.setSpacing(8)
 
-        header = QLabel(
-            f"<b>{len(self._orphans)} page(s) couldn't be matched to a student "
-            "via QR.</b><br>"
-            "Pick which student each one belongs to. Same first name on "
-            "multiple pages combines those pages into one packet (in PDF "
-            "page order)."
-        )
+        if edit_mode:
+            n = len(self._target_pages)
+            header = QLabel(
+                f"<b>Editing {n} page(s) for "
+                f"{edit_title.split(' — ')[-1] if edit_title else 'this student'}.</b><br>"
+                "Change the name to reassign a page to a different student, "
+                "or blank the name to send it back to the orphan list. The "
+                "packet-page spinner controls the page's position inside "
+                "the packet."
+            )
+        else:
+            header = QLabel(
+                f"<b>{len(self._target_pages)} page(s) couldn't be matched to a student "
+                "via QR.</b><br>"
+                "Pick which student each one belongs to. Same first name on "
+                "multiple pages combines those pages into one packet (in PDF "
+                "page order)."
+            )
         header.setWordWrap(True)
         outer.addWidget(header)
 
         class_row = QHBoxLayout()
         class_row.addWidget(QLabel("Class:"))
-        self.class_edit = QLineEdit(_default_class(pages, class_hint))
+        # In edit mode, prefer the student's existing class so we don't
+        # silently rewrite it when the teacher just tweaks a packet page.
+        default_cls = ""
+        if edit_mode:
+            for p in self._target_pages:
+                if p.student_class:
+                    default_cls = p.student_class
+                    break
+        if not default_cls:
+            default_cls = _default_class(pages, class_hint)
+        self.class_edit = QLineEdit(default_cls)
         self.class_edit.setMaximumWidth(220)
         class_row.addWidget(self.class_edit)
         class_row.addStretch(1)
         outer.addLayout(class_row)
 
-        # Roster minus already-decoded names = suggested choices.
+        # Roster minus already-decoded names = suggested choices. In
+        # edit mode, the current student is allowed too (otherwise the
+        # combobox wouldn't include their own name to keep).
         roster = _load_roster_names(roster_path)
         decoded = _decoded_names(pages)
+        if edit_mode:
+            preset_names = {p.student_name for p in self._target_pages if p.student_name}
+            decoded = decoded - preset_names
         suggestions = [n for n in roster if n not in decoded]
 
         # Render thumbnails once (avoid re-rendering on dialog resize).
@@ -221,9 +282,23 @@ class OrphanRecoveryDialog(QDialog):
             scroll_layout = QVBoxLayout(scroll_inner)
             scroll_layout.setContentsMargins(4, 4, 4, 4)
             scroll_layout.setSpacing(8)
-            for idx, p in enumerate(self._orphans, start=1):
+            for idx, p in enumerate(self._target_pages, start=1):
                 thumb = _render_thumbnail(doc, p.pdf_page_number)
-                row = _OrphanRow(p.pdf_page_number, idx, thumb, suggestions)
+                default_packet = (p.page_in_packet
+                                  if edit_mode and p.page_in_packet else idx)
+                preset_name = p.student_name if edit_mode and p.student_name else ""
+                hint = None
+                if edit_mode:
+                    hint = (
+                        "Blank the name to remove this page from the student "
+                        "(it goes back to the orphan banner so you can reassign "
+                        "it). Otherwise change the name to move it to a "
+                        "different student, or tweak the packet-page spinner."
+                    )
+                row = _OrphanRow(
+                    p.pdf_page_number, default_packet, thumb, suggestions,
+                    preset_name=preset_name, hint_text=hint,
+                )
                 scroll_layout.addWidget(row)
                 self._rows.append(row)
             scroll_layout.addStretch(1)
@@ -247,11 +322,16 @@ class OrphanRecoveryDialog(QDialog):
             self.class_edit.setFocus()
             return
 
-        # Collect (name, packet_page, pdf_page) for every named row.
+        # Collect (name, packet_page, pdf_page) for every named row,
+        # plus the set of pages the teacher actively blanked (only
+        # meaningful in edit mode — orphan mode just leaves blanks be).
         by_name: dict[str, list[tuple[int, int]]] = {}
+        cleared: set[int] = set()
         for row in self._rows:
             name = row.chosen_name()
             if not name:
+                if row.is_cleared():
+                    cleared.add(row.page_number)
                 continue
             by_name.setdefault(name, []).append((row.packet_page(), row.page_number))
 
@@ -285,4 +365,5 @@ class OrphanRecoveryDialog(QDialog):
                     "pages_total": pages_total,
                 }
         self.selections = selections
+        self.cleared_pages = cleared
         self.accept()

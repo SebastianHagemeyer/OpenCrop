@@ -108,6 +108,7 @@ class ScanResultView(QWidget):
     # stays a pure view.
     view_pages_requested = Signal(str)             # folder_name
     skip_toggled = Signal(str, bool)               # folder_name, new_skipped_state
+    edit_assignment_requested = Signal(str)        # folder_name
 
     def __init__(self) -> None:
         super().__init__()
@@ -248,6 +249,11 @@ class ScanResultView(QWidget):
             lambda: self.view_pages_requested.emit(folder)
         )
         menu.addAction(view_action)
+        edit_action = QAction("Edit assignment...", menu)
+        edit_action.triggered.connect(
+            lambda: self.edit_assignment_requested.emit(folder)
+        )
+        menu.addAction(edit_action)
         menu.addSeparator()
         toggle_label = (
             "Include in extraction" if is_skipped else "Skip from extraction"

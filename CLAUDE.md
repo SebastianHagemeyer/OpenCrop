@@ -61,11 +61,12 @@ The roster used for the dropdown comes from `QMARK_CLASS_PATH` (an .xlsx with `N
 
 Each row also has a **Packet page** spinbox. Default value is the row's PDF-order index (row 1 → 1, row 2 → 2, …), so the historical behaviour is the default. The spinner lets the teacher override when pages were handed in out of order (e.g. a 2-page packet where the student stapled them in reverse). On Apply, pages for the same student are grouped by name and sorted by the spinbox values; duplicate packet pages for one name trigger a warning instead of silently overwriting an override. `pages_total` is set to `max(packet_page)` per name, so a sparse claim (1 and 3 with no 2) is allowed — the teacher knows their data.
 
-## Skip / view from the roster (right-click)
+## Skip / view / edit from the roster (right-click)
 
 Right-clicking a student row in `ScanResultView` opens a small menu:
 
 - **View pages...** (also bound to double-click) opens `PageViewerDialog` — a horizontal strip of low-DPI thumbnails for every PDF page in that student's packet. Useful for confirming a recovered student really is who you think they are, or spotting a mis-grouping before extract.
+- **Edit assignment...** reopens `OrphanRecoveryDialog` in **edit mode** for that student. Each row is pre-filled with the page's current name and packet position; the teacher can rename a page to a different student, tweak the packet-page spinner, or **blank the name to send the page back to the orphan banner**. The dialog returns both `selections` (new/updated assignments) and `cleared_pages` (rows the teacher blanked); the launcher's `_apply_dialog_result` does a read-modify-write merge into `<pdf>.qrfix.json` so unrelated overrides on the same scan aren't trampled. In-memory undo is instant — `_clear_overrides` restores each page from the `pre_override` snapshot that `_apply_overrides` captures on first apply.
 - **Skip from extraction** / **Include in extraction** toggles whether the student is excluded. Skipped rows render strikethrough + grey + a `skipped — <status>` label, and the header counts them separately (e.g. `10MATD — 18 students, 2 skipped`).
 
 Skip state lives in the same `<pdf>.qrfix.json` sidecar as the recovery overrides, under a `skipped_students` array of folder_names:

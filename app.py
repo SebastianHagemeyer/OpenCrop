@@ -40,8 +40,10 @@ from page_viewer import PageViewerDialog
 from qmark_theme import apply_qmark_theme
 from scan_index import (
     _apply_overrides,
+    _clear_overrides,
     group_into_students,
     index_pdf,
+    load_sidecar_overrides,
     load_skipped_students,
     save_sidecar_overrides,
     save_skipped_students,
@@ -238,6 +240,7 @@ class Launcher(QMainWindow):
         self.scan_view.resolve_clicked.connect(self._open_orphan_dialog)
         self.scan_view.view_pages_requested.connect(self._view_pages_for)
         self.scan_view.skip_toggled.connect(self._toggle_skip)
+        self.scan_view.edit_assignment_requested.connect(self._edit_assignment_for)
         split.addWidget(self.scan_view)
 
         self.log = QPlainTextEdit()
@@ -500,33 +503,92 @@ class Launcher(QMainWindow):
         if result != QDialog.Accepted:
             self._append_log("Recovery dialog cancelled — orphans left as-is.")
             return
-        if not dlg.selections:
-            self._append_log("Recovery dialog closed without naming any pages — orphans left as-is.")
+        if not dlg.selections and not dlg.cleared_pages:
+            self._append_log("Recovery dialog closed without changes.")
             return
 
-        sidecar = save_sidecar_overrides(self._last_pdf, dlg.selections)
-        _apply_overrides(self._last_pages, dlg.selections)
-
-        # Summarise what just happened — name the recovered students so
-        # the user sees the names that just landed in the roster.
-        names = sorted({s["name"] for s in dlg.selections.values() if s.get("name")})
+        names = self._apply_dialog_result(dlg)
+        names_blob = ", ".join(names) if names else "(none)"
         n_pages = len(dlg.selections)
         n_students = len(names)
-        names_blob = ", ".join(names) if names else "(none)"
         self._append_log(
             f"Recovered {n_students} student"
             f"{'s' if n_students != 1 else ''} "
             f"({names_blob}) from {n_pages} orphan page"
-            f"{'s' if n_pages != 1 else ''} -> saved {sidecar.name}"
+            f"{'s' if n_pages != 1 else ''}."
         )
         self.status.showMessage(
             f"Recovered {names_blob} — sidecar saved.", 6000
         )
 
-        # Repaint the roster: the orphan banner disappears and the new
-        # students appear as rows tagged 'manual'.
-        self._refresh_view()
         self.btn_fix.setEnabled(self._has_orphans())
+
+    def _edit_assignment_for(self, folder_name: str) -> None:
+        """Right-click → Edit assignment. Reopen the dialog for one student."""
+        if not self._last_pdf or not self._last_pages:
+            return
+        groups = group_into_students(self._last_pages)
+        match = next((g for g in groups if g.folder_name == folder_name), None)
+        if match is None:
+            return
+        page_nums = [p.pdf_page_number for p in match.pages]
+        roster = Path(QMARK_CLASS_PATH) if QMARK_CLASS_PATH else None
+        dlg = OrphanRecoveryDialog(
+            self._last_pdf,
+            self._last_pages,
+            class_hint=QMARK_CLASS_NAME,
+            roster_path=roster,
+            pages_to_edit=page_nums,
+            edit_title=f"Edit assignment — {match.student_name}",
+            parent=self,
+        )
+        if dlg.exec() != QDialog.Accepted:
+            self._append_log(f"Edit cancelled for {match.student_name}.")
+            return
+        if not dlg.selections and not dlg.cleared_pages:
+            self._append_log(f"No changes to {match.student_name}.")
+            return
+        new_names = self._apply_dialog_result(dlg)
+        self._append_log(
+            f"Updated assignment for {match.student_name} "
+            f"({len(dlg.selections)} kept/reassigned, "
+            f"{len(dlg.cleared_pages)} cleared)."
+        )
+        # Status bar hint when the edit removed pages entirely so the
+        # user notices the orphan banner reappear.
+        if dlg.cleared_pages and self._has_orphans():
+            self.status.showMessage(
+                "Cleared pages are back in the orphan banner — click "
+                "Resolve to reassign.", 6000,
+            )
+        self.btn_fix.setEnabled(self._has_orphans())
+
+    def _apply_dialog_result(self, dlg) -> list[str]:
+        """Merge a dialog's (selections, cleared_pages) into the sidecar.
+
+        Replacing the entire overrides block would silently wipe any
+        unrelated overrides for the same scan (e.g. you edit Arvin while
+        Shylah's override is also live). Read-modify-write keeps every
+        student's manual fix intact and only touches the pages the
+        dialog actually returned.
+
+        Returns the sorted list of distinct student names that the
+        dialog claimed via selections, for the launcher's log line.
+        """
+        if self._last_pdf is None or self._last_pages is None:
+            return []
+        existing = load_sidecar_overrides(self._last_pdf)
+        for pn in dlg.cleared_pages:
+            existing.pop(pn, None)
+        existing.update(dlg.selections)
+        save_sidecar_overrides(self._last_pdf, existing)
+        # In-memory: undo first so a reassigned page gets its snapshot
+        # restored before _apply_overrides re-snapshots from the
+        # post-restore state.
+        _clear_overrides(self._last_pages, dlg.cleared_pages)
+        _apply_overrides(self._last_pages, dlg.selections)
+        self._refresh_view()
+        return sorted({s["name"] for s in dlg.selections.values() if s.get("name")})
 
     # ---------- stage 2: define regions ----------
 

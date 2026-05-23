@@ -37,6 +37,11 @@ class PageRecord:
     pages_total: int | None       # total pages in the student's packet
     qr_raw: str | None
     qr_status: str                # "decoded" | "preprocessed" | "inferred" | "override" | "unknown"
+    # Snapshot of the pre-override state, captured the first time
+    # _apply_overrides stamps this page. ``_clear_overrides`` reads it
+    # to undo the override without re-indexing the PDF. Stays None for
+    # any page that has never been overridden.
+    pre_override: dict | None = None
 
 
 @dataclass
@@ -226,6 +231,10 @@ def _apply_overrides(pages: list[PageRecord], overrides: dict[int, dict]) -> Non
     over, or otherwise undecodable. Pages with a valid override become
     anchors that ``_infer_missing`` can lean on for nearby still-unknown
     pages.
+
+    Snapshots the pre-override state on the page record on the first
+    apply so ``_clear_overrides`` can undo the change later without
+    re-running the (~70s) PDF index.
     """
     for p in pages:
         ov = overrides.get(p.pdf_page_number)
@@ -235,6 +244,14 @@ def _apply_overrides(pages: list[PageRecord], overrides: dict[int, dict]) -> Non
         name = (ov.get("name") or "").strip()
         if not cls or not name:
             continue
+        if p.pre_override is None:
+            p.pre_override = {
+                "student_class": p.student_class,
+                "student_name": p.student_name,
+                "page_in_packet": p.page_in_packet,
+                "pages_total": p.pages_total,
+                "qr_status": p.qr_status,
+            }
         p.student_class = cls
         p.student_name = name
         pip = ov.get("page_in_packet")
@@ -243,6 +260,30 @@ def _apply_overrides(pages: list[PageRecord], overrides: dict[int, dict]) -> Non
             p.page_in_packet = pip
             p.pages_total = tot
         p.qr_status = "override"
+
+
+def _clear_overrides(pages: list[PageRecord], page_numbers) -> None:
+    """Undo overrides for the listed PDF page numbers in-place.
+
+    Restores each affected page from its ``pre_override`` snapshot so
+    the launcher can repaint immediately without re-indexing the PDF.
+    Pages with no snapshot (never overridden) are no-ops.
+    """
+    wanted = set(page_numbers)
+    if not wanted:
+        return
+    for p in pages:
+        if p.pdf_page_number not in wanted:
+            continue
+        snap = p.pre_override
+        if snap is None:
+            continue
+        p.student_class = snap["student_class"]
+        p.student_name = snap["student_name"]
+        p.page_in_packet = snap["page_in_packet"]
+        p.pages_total = snap["pages_total"]
+        p.qr_status = snap["qr_status"]
+        p.pre_override = None
 
 
 def index_pdf(pdf_path: Path, dpi: int = 250) -> list[PageRecord]:
