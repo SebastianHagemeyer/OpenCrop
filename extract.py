@@ -441,6 +441,7 @@ def extract(
     skip_existing: bool = False,
     include_mc_pages: bool = True,
     cached_pages: list[PageRecord] | None = None,
+    extra_skipped: set[str] | None = None,
 ) -> None:
     template = yaml.safe_load(template_path.read_text(encoding="utf-8"))
     pages_per_student: int = template["pages_per_student"]
@@ -483,6 +484,13 @@ def extract(
     user_skipped = load_skipped_students(pdf_path)
     if user_skipped:
         print(f"  user-skipped: {len(user_skipped)} student(s) (sidecar)")
+    # Extra in-memory skips from the launcher — used for class auto-skip
+    # when qmark passes QMARK_CLASS_NAME. Deliberately NOT persisted to
+    # the sidecar so reopening OpenCrop for a different class re-evaluates
+    # from scratch instead of inheriting stale exclusions.
+    if extra_skipped:
+        user_skipped = user_skipped | set(extra_skipped)
+        print(f"  + {len(extra_skipped)} extra skip(s) from launcher")
 
     exam_out = output_dir / exam_name
     exam_out.mkdir(parents=True, exist_ok=True)

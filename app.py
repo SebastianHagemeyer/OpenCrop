@@ -139,6 +139,15 @@ class Launcher(QMainWindow):
         # Check scan, and resume after _on_pages_indexed fires. None
         # means no pending extract.
         self._pending_extract: dict | None = None
+        # Class-aware auto-skip state. Populated each time the scan is
+        # re-indexed when qmark passed QMARK_CLASS_NAME: any student
+        # whose QR-decoded class doesn't match the hint lands in
+        # _auto_skipped and is excluded from extraction by default.
+        # _force_included tracks user overrides via right-click →
+        # Include in extraction; session-scoped so reopening for a
+        # different class re-applies the auto-skip cleanly.
+        self._auto_skipped: set[str] = set()
+        self._force_included: set[str] = set()
 
         self._build()
         self.log_signal.connect(self._append_log)
@@ -422,13 +431,41 @@ class Launcher(QMainWindow):
 
         self._run_in_thread(work)
 
+    def _recompute_auto_skipped(self) -> None:
+        """Recompute the class-mismatch skip set from the current page
+        list. No-op when qmark didn't pass a class hint (standalone
+        OpenCrop launch should never auto-skip)."""
+        self._auto_skipped = set()
+        if not QMARK_CLASS_NAME or self._last_pages is None:
+            return
+        target = QMARK_CLASS_NAME.strip().lower()
+        groups = group_into_students(self._last_pages)
+        for g in groups:
+            cls = (g.student_class or "").strip()
+            # Orphans are class="UNKNOWN" — leave those for the orphan
+            # recovery dialog, don't pre-skip them as wrong-class.
+            if not cls or cls.upper() == "UNKNOWN":
+                continue
+            if cls.lower() != target:
+                self._auto_skipped.add(g.folder_name)
+
+    def _effective_skipped(self) -> set[str]:
+        """Union of sidecar (persistent) + auto-skip (session) minus the
+        user's force-include overrides. Single source of truth for what
+        the UI shows as 'skipped' and what extract should exclude."""
+        sidecar = (
+            load_skipped_students(self._last_pdf) if self._last_pdf else set()
+        )
+        return sidecar | (self._auto_skipped - self._force_included)
+
     def _refresh_view(self) -> None:
         """Re-render the class roster from the cached page list."""
         if self._last_pages is None:
             self.scan_view.clear()
             return
-        skipped = load_skipped_students(self._last_pdf) if self._last_pdf else set()
-        self.scan_view.set_pages(self._last_pages, skipped=skipped)
+        self.scan_view.set_pages(
+            self._last_pages, skipped=self._effective_skipped(),
+        )
 
     def _view_pages_for(self, folder_name: str) -> None:
         """Open the page-viewer dialog for one roster row."""
@@ -445,17 +482,40 @@ class Launcher(QMainWindow):
         dlg.exec()
 
     def _toggle_skip(self, folder_name: str, skip: bool) -> None:
-        """Right-click → Skip from extraction (or undo)."""
+        """Right-click → Skip from extraction (or undo).
+
+        Two skip sources can be layered on one row: the sidecar
+        (persistent — user's explicit Skip clicks) and the in-memory
+        auto-skip set (session-only — class-mismatch filter). Include
+        has to clear BOTH layers, otherwise a student who landed in
+        sidecar (e.g. an earlier manual skip) and is also wrong-class
+        stays crossed out even after the override fires. Skip writes
+        to the sidecar for persistence and drops any force-include
+        override so it doesn't immediately undo itself."""
         if not self._last_pdf:
             return
-        current = load_skipped_students(self._last_pdf)
+        sidecar = load_skipped_students(self._last_pdf)
         if skip:
-            current.add(folder_name)
+            self._force_included.discard(folder_name)
+            if folder_name not in sidecar:
+                sidecar.add(folder_name)
+                save_skipped_students(self._last_pdf, sidecar)
             verb = "Skipping"
         else:
-            current.discard(folder_name)
-            verb = "Including"
-        save_skipped_students(self._last_pdf, current)
+            # Clear sidecar entry if present so the row actually un-skips
+            # regardless of how it got skipped (manual click → sidecar,
+            # class mismatch → auto-skip, or both).
+            if folder_name in sidecar:
+                sidecar.discard(folder_name)
+                save_skipped_students(self._last_pdf, sidecar)
+            # Record force-include override for the auto-skip layer too,
+            # session-only — deliberately not persisted so reopening
+            # OpenCrop for a different class re-evaluates from scratch.
+            if folder_name in self._auto_skipped:
+                self._force_included.add(folder_name)
+                verb = "Including (overrides class auto-skip)"
+            else:
+                verb = "Including"
         self._append_log(f"{verb} {folder_name} (extraction).")
         self._refresh_view()
 
@@ -472,6 +532,10 @@ class Launcher(QMainWindow):
         pdf, pages = payload
         self._last_pdf = pdf
         self._last_pages = pages
+        # Fresh PDF index: drop any stale user overrides so an old
+        # "Include in extraction" from a previous PDF doesn't leak in.
+        self._force_included = set()
+        self._recompute_auto_skipped()
         self._refresh_view()
         n_students, n_orphan = self._summarize_pages(pages)
         msg = f"Indexed {len(pages)} pages -> {n_students} student"
@@ -479,6 +543,17 @@ class Launcher(QMainWindow):
         if n_orphan:
             msg += f"  ({n_orphan} orphan page{'s' if n_orphan != 1 else ''} need a name)"
         self._append_log(msg)
+        if self._auto_skipped:
+            other_classes = sorted({
+                fn.split("_", 1)[0] for fn in self._auto_skipped
+                if "_" in fn
+            })
+            classes_blob = ", ".join(other_classes) if other_classes else "other"
+            self._append_log(
+                f"Auto-skipped {len(self._auto_skipped)} student(s) from "
+                f"{classes_blob} — only {QMARK_CLASS_NAME} will be extracted. "
+                f"Right-click → Include in extraction to override."
+            )
         self.btn_fix.setEnabled(n_orphan > 0)
         # If Extract is waiting on this scan, hand off — it owns the
         # orphan prompt for that path so we don't double-prompt the
@@ -804,6 +879,11 @@ class Launcher(QMainWindow):
         log_signal = self.log_signal
         busy_signal = self.busy_signal
         cached_pages = self._last_pages
+        # Class-based auto-skips are session-only — pass the current
+        # effective set so extract excludes them without polluting the
+        # sidecar (which would bite the next launch for a different
+        # class).
+        extra_skipped = self._auto_skipped - self._force_included
 
         class _LogStream(io.TextIOBase):
             def write(self, s: str) -> int:
@@ -826,6 +906,7 @@ class Launcher(QMainWindow):
                         skip_existing=params["skip_existing"],
                         include_mc_pages=params["include_mc_pages"],
                         cached_pages=cached_pages,
+                        extra_skipped=extra_skipped,
                     )
                 log_signal.emit("Extract finished.\n")
             except SystemExit as e:

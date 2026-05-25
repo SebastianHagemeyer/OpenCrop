@@ -220,6 +220,19 @@ class ScanResultView(QWidget):
                     f.setItalic(True)
                     item.setFont(col, f)
             else:
+                # Defensive reset across all three columns — Qt has
+                # historically been finicky about font flags persisting
+                # on QTreeWidgetItems even after clear/re-add, so when
+                # a user toggles "Include in extraction" we explicitly
+                # spell out the non-skipped baseline (no strikethrough,
+                # no italic, default foreground) instead of trusting
+                # the fresh-item default.
+                for col in (0, 1, 2):
+                    item.setData(col, Qt.ForegroundRole, None)
+                    f = item.font(col)
+                    f.setStrikeOut(False)
+                    f.setItalic(False)
+                    item.setFont(col, f)
                 color = _STATUS_COLORS.get(worst)
                 if color:
                     # Tint the status cell so the colour reads at a glance
