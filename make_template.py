@@ -18,9 +18,11 @@ Workflow:
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 
 # When launched from qmark, the parent passes the marking scheme's question
@@ -240,10 +242,11 @@ class TemplateEditor(QMainWindow):
     _index_failed = Signal(int, str)         # (token, error)
 
     def __init__(self, pdf_path: Path,
-                 cached_pages: list[PageRecord] | None = None) -> None:
+                 cached_pages: list[PageRecord] | None = None,
+                 template_path: Path | None = None) -> None:
         super().__init__()
         self.pdf_path = pdf_path
-        self.setWindowTitle(f"Template editor — {self.pdf_path.name}")
+        self.setWindowTitle(f"Sheet Regions Editor — {self.pdf_path.name}")
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
 
@@ -265,7 +268,21 @@ class TemplateEditor(QMainWindow):
         # Consumed on the first _load_pdf call; re-opening a different
         # PDF via "Open PDF..." falls back to streaming as before.
         self._cached_pages = cached_pages
-
+        # Edit-existing flow: when the launcher passes an existing
+        # Sheet Regions file in, load its regions + mc_pages so the
+        # editor opens up populated with prior work. _bootstrap_editor
+        # consumes _pending_template_data on the first PDF render,
+        # then clears it so a later Open PDF... starts fresh.
+        self.template_path = template_path
+        self._pending_template_data: dict | None = None
+        if template_path is not None and template_path.is_file():
+            try:
+                with open(template_path, "r", encoding="utf-8") as f:
+                    self._pending_template_data = yaml.safe_load(f) or {}
+            except (OSError, yaml.YAMLError):
+                # Broken file → fall back to empty editor; user can
+                # still re-create regions and overwrite on save.
+                self._pending_template_data = None
 
         self._build_ui()
         self._groups_updated.connect(self._on_groups_updated)
@@ -345,7 +362,7 @@ class TemplateEditor(QMainWindow):
         nav.addWidget(self.next_btn)
         side_lay.addLayout(nav)
 
-        self.save_btn = QPushButton("Save template…")
+        self.save_btn = QPushButton("Save Sheet Regions…")
         self.save_btn.clicked.connect(self._save)
         side_lay.addWidget(self.save_btn)
 
@@ -385,7 +402,7 @@ class TemplateEditor(QMainWindow):
         self._index_token += 1
         token = self._index_token
         self.groups = []
-        self.setWindowTitle(f"Template editor — {path.name}  (indexing…)")
+        self.setWindowTitle(f"Sheet Regions Editor — {path.name}  (indexing…)")
         self._set_busy(True)
         self.page_label.setText("Indexing pages and decoding QR codes…")
 
@@ -476,7 +493,7 @@ class TemplateEditor(QMainWindow):
             if groups:
                 self._bootstrap_editor(path, groups)
             elif done:
-                self.setWindowTitle(f"Template editor — {path.name}")
+                self.setWindowTitle(f"Sheet Regions Editor — {path.name}")
                 self.page_label.setText("")
                 self._set_busy(False)
                 QMessageBox.critical(
@@ -506,10 +523,10 @@ class TemplateEditor(QMainWindow):
                         break
             self._refresh_student_combo()
         if done:
-            self.setWindowTitle(f"Template editor — {path.name}")
+            self.setWindowTitle(f"Sheet Regions Editor — {path.name}")
         else:
             self.setWindowTitle(
-                f"Template editor — {path.name}  "
+                f"Sheet Regions Editor — {path.name}  "
                 f"(indexing {page_num}/{total}…)"
             )
 
@@ -525,6 +542,38 @@ class TemplateEditor(QMainWindow):
         self.regions.clear()
         self.mc_pages.clear()
         self.next_q_num = 1
+        # Consume the edit-existing payload once: replay saved regions
+        # so the editor opens up with prior work intact, and snap the
+        # reference-student dropdown back to whoever the original
+        # template was defined against. Falls back to fresh-editor
+        # defaults when this is a brand-new PDF or the launcher didn't
+        # pass a template.
+        pending = self._pending_template_data
+        if pending:
+            for q in (pending.get("questions") or []):
+                try:
+                    self.regions.append({
+                        "q": q["q"],
+                        "page": int(q["page"]),
+                        "bbox": [float(v) for v in q["bbox"]],
+                    })
+                except (KeyError, TypeError, ValueError):
+                    continue
+            for p in (pending.get("mc_pages") or []):
+                try:
+                    self.mc_pages.add(int(p))
+                except (TypeError, ValueError):
+                    continue
+            # next_q_num picks up where the saved file left off so
+            # newly drawn boxes don't collide with existing q codes.
+            self.next_q_num = len(self.regions) + 1
+            ref = pending.get("reference_student")
+            if ref:
+                for i, g in enumerate(self.groups):
+                    if g.folder_name == ref:
+                        self.current_group_idx = i
+                        break
+            self._pending_template_data = None
         self._refresh_student_combo()
         self._refresh_region_list()
         self._set_busy(False)
@@ -541,7 +590,7 @@ class TemplateEditor(QMainWindow):
     def _on_index_failed(self, token: int, error: str) -> None:
         if token != self._index_token:
             return
-        self.setWindowTitle(f"Template editor — {self.pdf_path.name}")
+        self.setWindowTitle(f"Sheet Regions Editor — {self.pdf_path.name}")
         self.page_label.setText("")
         self._set_busy(False)
         QMessageBox.critical(self, "Indexing failed", error)
@@ -674,10 +723,17 @@ class TemplateEditor(QMainWindow):
             )
             return
         pages_per_student = len(self._current_group().pages)
-        initial_dir = _writable_templates_dir(self.pdf_path)
-        initial_path = str(initial_dir / f"{self.pdf_path.stem}.yaml")
+        # Prefer the file we opened from — re-saving lands on top of
+        # the existing Sheet Regions file (with the OS's standard
+        # overwrite confirm) so editing an existing template is a
+        # one-click round-trip instead of fighting the file dialog.
+        if self.template_path is not None:
+            initial_path = str(self.template_path)
+        else:
+            initial_dir = _writable_templates_dir(self.pdf_path)
+            initial_path = str(initial_dir / f"{self.pdf_path.stem}.yaml")
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save template", initial_path, "YAML (*.yaml)"
+            self, "Save Sheet Regions", initial_path, "Sheet regions (*.yaml)"
         )
         if not path:
             return
@@ -700,6 +756,31 @@ class TemplateEditor(QMainWindow):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             yaml.safe_dump(template, f, sort_keys=False)
+        # Remember the saved location so the next Save defaults to the
+        # same path — typical edit flow is save, tweak, save again.
+        self.template_path = Path(path)
+        # Writeback to qmark: drop a small stamp file in the directory
+        # qmark told us about, keyed on the worksheet stem. Lets the
+        # dashboard pick up Browse-then-save choices without any UI
+        # of its own. Silently no-ops when launched standalone or
+        # when QMARK_SHEET_PATH wasn't supplied.
+        stamp_dir = os.environ.get("QMARK_TEMPLATE_STAMP_DIR", "").strip()
+        sheet_path = os.environ.get("QMARK_SHEET_PATH", "").strip()
+        if stamp_dir and sheet_path:
+            sheet_stem = Path(sheet_path).stem
+            if sheet_stem:
+                try:
+                    Path(stamp_dir).mkdir(parents=True, exist_ok=True)
+                    stamp_file = Path(stamp_dir) / f"{sheet_stem}.json"
+                    with open(stamp_file, "w", encoding="utf-8") as f:
+                        json.dump({
+                            "path": str(path),
+                            "saved_at": datetime.now().isoformat(timespec="seconds"),
+                        }, f, indent=2)
+                except OSError:
+                    # Stamp failure isn't fatal — qmark will fall back
+                    # to derivation; the user's save itself succeeded.
+                    pass
         mc_suffix = (
             f" + {len(mc_pages_sorted)} MC page(s)" if mc_pages_sorted else ""
         )

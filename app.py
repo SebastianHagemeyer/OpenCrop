@@ -63,6 +63,13 @@ QMARK_CLASS_NAME = os.environ.get("QMARK_CLASS_NAME", "").strip()
 # every student crop as attempted/unattempted/borderline — see attempts.csv
 # under each exam's output folder.
 QMARK_SHEET_PATH = os.environ.get("QMARK_SHEET_PATH", "").strip()
+# Sheet Regions YAML supplied by qmark. Either the explicit path saved
+# in the session JSON, or derived next to the worksheet PDF. Pre-fills
+# the Sheet Regions edit and biases _autofill_template so the same
+# YAML is reused across multiple scan batches of one worksheet
+# (instead of looking up by scan-PDF stem, which gave a fresh name
+# every time a new scan was indexed).
+QMARK_TEMPLATE_PATH = os.environ.get("QMARK_TEMPLATE_PATH", "").strip()
 # Class roster xlsx supplied by the dashboard. Used by the orphan
 # recovery dialog to populate the student-name dropdown with the names
 # that the QR pipeline didn't pick up for this scan.
@@ -78,6 +85,62 @@ def _display_path(p) -> str:
     if not p:
         return ""
     return str(p).replace("\\", "/")
+
+
+def _pretty_path(path, root) -> str:
+    """Stem-only when path sits directly in root, "subfolder/stem"
+    when nested under root, full forward-slashed path otherwise.
+    Mirrors qmark's _sheet_display so the launcher's line edits stop
+    showing 90-character paths for files that live in a known root."""
+    if not path:
+        return ""
+    s = str(path)
+    if not root:
+        return _display_path(s)
+    try:
+        abs_path = os.path.abspath(s)
+        abs_root = os.path.abspath(root)
+        if os.path.normcase(abs_path).startswith(
+            os.path.normcase(abs_root) + os.sep
+        ):
+            rel = os.path.relpath(abs_path, abs_root).replace("\\", "/")
+            if "/" not in rel:
+                return os.path.splitext(rel)[0]
+            head, tail = rel.rsplit("/", 1)
+            return f"{head}/{os.path.splitext(tail)[0]}"
+    except (ValueError, OSError):
+        pass
+    return _display_path(s)
+
+
+def _resolve_against_roots(value, roots, extensions=(".pdf",)) -> Path | None:
+    """Resolve a (possibly stem-only) value back to a real file.
+
+    Walk a priority list of roots — qmark's configured folder first,
+    then the local fallback. Tries the value as-is (absolute or
+    cwd-relative), then `root / value`, then `root / value+ext` for
+    each extension. First hit wins. Returns None when nothing resolves
+    so callers can warn instead of opening a phantom path."""
+    if not value:
+        return None
+    v = str(value).strip().strip('"')
+    p = Path(v)
+    if p.is_absolute() and p.is_file():
+        return p
+    if p.is_file():
+        return p.resolve()
+    for root in roots:
+        if not root:
+            continue
+        root_path = Path(root)
+        cand = root_path / v
+        if cand.is_file():
+            return cand.resolve()
+        for ext in extensions:
+            cand = root_path / (v + ext)
+            if cand.is_file():
+                return cand.resolve()
+    return None
 
 
 def _qmark_output_name() -> str:
@@ -153,20 +216,29 @@ class Launcher(QMainWindow):
         self.log_signal.connect(self._append_log)
         self.busy_signal.connect(self._set_busy)
         self.tpl_path_signal.connect(
-            lambda p: self.tpl_edit.setText(_display_path(p))
+            lambda p: self.tpl_edit.setText(_pretty_path(p, self._tpl_root()))
         )
         self.pages_indexed_signal.connect(self._on_pages_indexed)
 
         default_pdf = HERE / DEFAULT_PDF_REL
         if default_pdf.exists():
-            self.pdf_edit.setText(_display_path(default_pdf))
+            self.pdf_edit.setText(_pretty_path(default_pdf, self._scans_root()))
             self.exam_name_edit.setText(default_pdf.stem)
             self._autofill_template()
         qmark_output = _qmark_output_name()
         if qmark_output:
             self.exam_name_edit.setText(qmark_output)
         if QMARK_SHEET_PATH:
-            self.sheet_edit.setText(_display_path(QMARK_SHEET_PATH))
+            self.sheet_edit.setText(_pretty_path(QMARK_SHEET_PATH, self._sheets_root()))
+        # Sheet Regions field only gets populated when a real YAML
+        # exists. If qmark's env path points at one, that wins over
+        # whatever _autofill_template found. If it points at a future
+        # save location (file doesn't exist yet), don't show a phantom
+        # path — _define_regions still routes Save to that location.
+        if QMARK_TEMPLATE_PATH and Path(QMARK_TEMPLATE_PATH).is_file():
+            self.tpl_edit.setText(
+                _pretty_path(QMARK_TEMPLATE_PATH, self._tpl_root())
+            )
 
     # ---------- layout ----------
 
@@ -187,7 +259,7 @@ class Launcher(QMainWindow):
         outer.addLayout(pdf_row)
 
         tpl_row = QHBoxLayout()
-        tpl_row.addWidget(QLabel("Template YAML:"))
+        tpl_row.addWidget(QLabel("Sheet Regions:"))
         self.tpl_edit = QLineEdit()
         tpl_row.addWidget(self.tpl_edit, 1)
         tpl_btn = QPushButton("Browse...")
@@ -219,19 +291,19 @@ class Launcher(QMainWindow):
         self.btn_check.clicked.connect(self._check_scan)
         self.btn_fix = QPushButton("Fix orphans...")
         self.btn_fix.clicked.connect(self._open_orphan_dialog)
-        self.btn_fix.setEnabled(False)
+        # Hidden by default — only ever shown when Check scan turns up
+        # at least one unmatched page. No orphans = no button (used to
+        # sit there disabled, which looked like a broken affordance).
+        self.btn_fix.setVisible(False)
         self.btn_fix.setToolTip(
             "Manually assign students to pages whose QR couldn't be "
-            "read (torn paper, drawn-over QR, etc). Enabled after "
-            "Check scan finds at least one orphan page."
+            "read (torn paper, drawn-over QR, etc)."
         )
         self.btn_define = QPushButton("2. Define regions")
         self.btn_define.clicked.connect(self._define_regions)
         self.btn_extract = QPushButton("3. Extract crops")
         self.btn_extract.clicked.connect(self._extract)
-        self.btn_open = QPushButton("Open output folder")
-        self.btn_open.clicked.connect(self._open_output)
-        for b in (self.btn_check, self.btn_fix, self.btn_define, self.btn_extract, self.btn_open):
+        for b in (self.btn_check, self.btn_fix, self.btn_define, self.btn_extract):
             actions.addWidget(b)
         self.skip_existing_cb = QCheckBox("Skip students already in manifest")
         self.skip_existing_cb.setToolTip(
@@ -240,16 +312,11 @@ class Launcher(QMainWindow):
             "appended without overwriting prior work."
         )
         actions.addWidget(self.skip_existing_cb)
-        self.include_mc_cb = QCheckBox("Include MC pages")
-        self.include_mc_cb.setChecked(True)
-        self.include_mc_cb.setToolTip(
-            "When on, the template's mc_pages list is honoured: each "
-            "marked packet page is written as a whole-page image "
-            "(MC_p<N>.png) per student so the MC grader can show what "
-            "the student filled in. Untick to skip MC captures even if "
-            "the template marks any."
-        )
-        actions.addWidget(self.include_mc_cb)
+        # "Include MC pages" used to be a checkbox here but there's no
+        # meaningful reason to disable it: if the Sheet Regions file has
+        # no mc_pages entry the extractor writes nothing regardless, and
+        # if it does have them the user wanted them captured (that's why
+        # they marked them in the editor). Always-on with no UI noise.
         actions.addStretch(1)
         outer.addLayout(actions)
 
@@ -291,10 +358,11 @@ class Launcher(QMainWindow):
     def _set_busy(self, busy: bool, label: str = "") -> None:
         for b in (self.btn_check, self.btn_define, self.btn_extract):
             b.setEnabled(not busy)
-        # Fix-orphans button is only meaningful after a Check scan
-        # surfaced at least one orphan; honour that state instead of
-        # blindly re-enabling here.
-        self.btn_fix.setEnabled((not busy) and self._has_orphans())
+        # Fix-orphans is hidden when there's nothing to fix (set by the
+        # _on_pages_indexed / toggle paths); here we just grey it out
+        # while a worker thread is running so it's not clickable
+        # mid-Check-scan / mid-Extract.
+        self.btn_fix.setEnabled(not busy)
         self.status.showMessage(label if busy else "Ready.")
 
     def _has_orphans(self) -> bool:
@@ -302,11 +370,62 @@ class Launcher(QMainWindow):
             return False
         return any(p.qr_status == "unknown" for p in self._last_pages)
 
+    # ---------- pretty-path roots (mirror qmark's Sheets/Scans display) ----------
+    def _scans_root(self) -> str:
+        """Preferred root for shortening the scan-PDF display. qmark's
+        Scans folder when launched from the dashboard, else local."""
+        return (
+            os.environ.get("QMARK_SCANS_DIR", "").strip()
+            or str(HERE / "workScans")
+        )
+
+    def _sheets_root(self) -> str:
+        """Preferred root for the worksheet Sheet PDF display."""
+        return os.environ.get("QMARK_SHEETS_DIR", "").strip()
+
+    def _tpl_root(self) -> str:
+        """Preferred root for the Sheet Regions display. Define regions
+        writes here too, so files round-trip with a clean stem-only name."""
+        return (
+            os.environ.get("QMARK_SHEETS_DIR", "").strip()
+            or str(HERE / "templates")
+        )
+
+    def _pdf_resolution_roots(self) -> list[str]:
+        return [
+            os.environ.get("QMARK_SCANS_DIR", "").strip(),
+            str(HERE / "workScans"),
+            str(HERE),
+        ]
+
+    def _sheet_resolution_roots(self) -> list[str]:
+        return [
+            os.environ.get("QMARK_SHEETS_DIR", "").strip(),
+            str(HERE),
+        ]
+
+    def _tpl_resolution_roots(self) -> list[str]:
+        sheets = os.environ.get("QMARK_SHEETS_DIR", "").strip()
+        return [
+            sheets,
+            os.path.join(sheets, "templates") if sheets else "",
+            str(HERE / "templates"),
+            str(HERE),
+        ]
+
     def _pdf_path(self) -> Path | None:
         s = self.pdf_edit.text().strip()
         if not s:
             QMessageBox.critical(self, "No PDF", "Pick a scan PDF first.")
             return None
+        # Resolve possibly stem-only display ("foo" → "<scans>/foo.pdf")
+        # before the legacy relative-to-HERE fallback so a clean display
+        # still finds its file.
+        resolved = _resolve_against_roots(
+            s, self._pdf_resolution_roots(), extensions=(".pdf",),
+        )
+        if resolved is not None:
+            return resolved
         p = Path(s)
         if not p.is_absolute():
             p = (HERE / p).resolve()
@@ -331,13 +450,53 @@ class Launcher(QMainWindow):
         paths.append(HERE / "templates" / f"{pdf_stem}.yaml")
         return paths
 
+    def _candidate_template_stems(self, pdf: Path) -> list[str]:
+        """Stems to try when auto-discovering a Sheet Regions YAML.
+
+        Sheet stem first (the canonical naming — the YAML describes
+        the worksheet, not any particular scan batch), then scan stem
+        as a legacy fallback for older sessions whose YAMLs were
+        named after the first scan that produced them."""
+        stems: list[str] = []
+        sheet_stem = self._sheet_stem_hint()
+        if sheet_stem and sheet_stem not in stems:
+            stems.append(sheet_stem)
+        if pdf.stem not in stems:
+            stems.append(pdf.stem)
+        return stems
+
+    def _sheet_stem_hint(self) -> str | None:
+        """Stem of the worksheet PDF (the SHEET, not the SCAN).
+        Resolved from sheet_edit's current value, with QMARK_SHEET_PATH
+        as a fallback for the very first paint before the user has
+        typed anything."""
+        sheet_str = self.sheet_edit.text().strip()
+        if sheet_str:
+            resolved = _resolve_against_roots(
+                sheet_str, self._sheet_resolution_roots(),
+                extensions=(".pdf",),
+            )
+            if resolved is not None:
+                return resolved.stem
+            return Path(sheet_str).stem
+        if QMARK_SHEET_PATH:
+            return Path(QMARK_SHEET_PATH).stem
+        return None
+
     def _template_path(self, pdf: Path) -> Path:
         """Best-guess template path when the user hasn't picked one — the
-        first candidate that exists, or the preferred save location."""
-        for c in self._template_search_paths(pdf.stem):
-            if c.exists():
-                return c
-        return self._template_search_paths(pdf.stem)[0]
+        first candidate that exists across both sheet and scan stems,
+        or the preferred save location (sheet stem if known) when
+        nothing's on disk yet."""
+        for stem in self._candidate_template_stems(pdf):
+            for c in self._template_search_paths(stem):
+                if c.exists():
+                    return c
+        # Nothing exists → pick the preferred save location: sheet stem
+        # under the canonical Sheets root so Define regions lands the
+        # new YAML where the next launch will look for it.
+        preferred_stem = self._candidate_template_stems(pdf)[0]
+        return self._template_search_paths(preferred_stem)[0]
 
     def _autofill_template(self) -> Path | None:
         pdf_str = self.pdf_edit.text().strip()
@@ -346,10 +505,11 @@ class Launcher(QMainWindow):
         pdf = Path(pdf_str)
         if not pdf.is_absolute():
             pdf = (HERE / pdf).resolve()
-        for c in self._template_search_paths(pdf.stem):
-            if c.exists():
-                self.tpl_edit.setText(_display_path(c))
-                return c
+        for stem in self._candidate_template_stems(pdf):
+            for c in self._template_search_paths(stem):
+                if c.exists():
+                    self.tpl_edit.setText(_pretty_path(c, self._tpl_root()))
+                    return c
         return None
 
     def _browse_pdf(self) -> None:
@@ -367,7 +527,7 @@ class Launcher(QMainWindow):
             "PDF files (*.pdf);;All files (*.*)",
         )
         if picked:
-            self.pdf_edit.setText(_display_path(picked))
+            self.pdf_edit.setText(_pretty_path(picked, self._scans_root()))
             # When running under qmark, the dashboard's <Class>_<Assignment>
             # is the canonical output-folder name — don't clobber it with
             # the PDF stem.
@@ -384,11 +544,11 @@ class Launcher(QMainWindow):
         else:
             initial = HERE
         picked, _ = QFileDialog.getOpenFileName(
-            self, "Pick template YAML", str(initial),
-            "YAML files (*.yaml *.yml);;All files (*.*)",
+            self, "Pick Sheet Regions file", str(initial),
+            "Sheet regions (*.yaml *.yml);;All files (*.*)",
         )
         if picked:
-            self.tpl_edit.setText(_display_path(picked))
+            self.tpl_edit.setText(_pretty_path(picked, self._tpl_root()))
 
     def _browse_sheet(self) -> None:
         qmark_sheets = os.environ.get("QMARK_SHEETS_DIR", "").strip()
@@ -404,7 +564,7 @@ class Launcher(QMainWindow):
             "PDF files (*.pdf);;All files (*.*)",
         )
         if picked:
-            self.sheet_edit.setText(_display_path(picked))
+            self.sheet_edit.setText(_pretty_path(picked, self._sheets_root()))
 
     def _run_in_thread(self, work) -> None:
         threading.Thread(target=work, daemon=True).start()
@@ -554,7 +714,7 @@ class Launcher(QMainWindow):
                 f"{classes_blob} — only {QMARK_CLASS_NAME} will be extracted. "
                 f"Right-click → Include in extraction to override."
             )
-        self.btn_fix.setEnabled(n_orphan > 0)
+        self.btn_fix.setVisible(n_orphan > 0)
         # If Extract is waiting on this scan, hand off — it owns the
         # orphan prompt for that path so we don't double-prompt the
         # user. Otherwise standalone Check auto-pops the dialog.
@@ -609,7 +769,7 @@ class Launcher(QMainWindow):
             f"Recovered {names_blob} — sidecar saved.", 6000
         )
 
-        self.btn_fix.setEnabled(self._has_orphans())
+        self.btn_fix.setVisible(self._has_orphans())
 
     def _edit_assignment_for(self, folder_name: str) -> None:
         """Right-click → Edit assignment. Reopen the dialog for one student."""
@@ -649,7 +809,7 @@ class Launcher(QMainWindow):
                 "Cleared pages are back in the orphan banner — click "
                 "Resolve to reassign.", 6000,
             )
-        self.btn_fix.setEnabled(self._has_orphans())
+        self.btn_fix.setVisible(self._has_orphans())
 
     def _apply_dialog_result(self, dlg) -> list[str]:
         """Merge a dialog's (selections, cleared_pages) into the sidecar.
@@ -703,8 +863,35 @@ class Launcher(QMainWindow):
             cached = self._last_pages
             self._append_log("Reusing cached scan from Check scan — no re-indexing needed.")
 
+        # Sheet Regions hand-off:
+        #   1. typed/displayed value resolves to a real file → edit it
+        #      (regions + mc_pages prepopulated, Save defaults to overwrite)
+        #   2. qmark passed an env path → use that as the Save target
+        #      so the first save lands where qmark will look next launch
+        #   3. nothing → editor opens fresh, Save defaults to the
+        #      scan-stem fallback (legacy standalone behaviour)
+        tpl_str = self.tpl_edit.text().strip()
+        intended_tpl: Path | None = None
+        if tpl_str:
+            intended_tpl = _resolve_against_roots(
+                tpl_str, self._tpl_resolution_roots(),
+                extensions=(".yaml", ".yml"),
+            )
+        if intended_tpl is None and QMARK_TEMPLATE_PATH:
+            intended_tpl = Path(QMARK_TEMPLATE_PATH)
+        if intended_tpl is not None and intended_tpl.is_file():
+            self._append_log(
+                f"Editing existing Sheet Regions: {intended_tpl.name}"
+            )
+        elif intended_tpl is not None:
+            self._append_log(
+                f"New Sheet Regions will save to: {intended_tpl}"
+            )
+
         try:
-            self._editor = TemplateEditor(pdf, cached_pages=cached)
+            self._editor = TemplateEditor(
+                pdf, cached_pages=cached, template_path=intended_tpl,
+            )
         except Exception as e:
             self._append_log(f"ERROR launching editor: {e}\n")
             self._set_busy(False, "")
@@ -727,7 +914,7 @@ class Launcher(QMainWindow):
             if existing:
                 latest = max(existing, key=lambda p: p.stat().st_mtime)
                 self.tpl_path_signal.emit(str(latest))
-                self.log_signal.emit(f"Template found: {latest}\n")
+                self.log_signal.emit(f"Sheet Regions found: {latest}\n")
         self.busy_signal.emit(False, "")
 
     # ---------- stage 3: extract ----------
@@ -738,7 +925,14 @@ class Launcher(QMainWindow):
             return
         tpl_str = self.tpl_edit.text().strip()
         if tpl_str:
-            tpl = Path(tpl_str)
+            resolved_tpl = _resolve_against_roots(
+                tpl_str, self._tpl_resolution_roots(),
+                extensions=(".yaml", ".yml"),
+            )
+            # Fall back to the raw value (typed by user, file may not
+            # exist yet) so the "missing" branch below can show a sensible
+            # error path instead of "/cwd/foo".
+            tpl = resolved_tpl if resolved_tpl is not None else Path(tpl_str)
             if not tpl.is_absolute():
                 tpl = (HERE / tpl).resolve()
         else:
@@ -746,12 +940,12 @@ class Launcher(QMainWindow):
         if not tpl.exists():
             QMessageBox.critical(
                 self,
-                "Missing template",
-                f"Template YAML not found:\n{tpl}\n\nPick one with the Browse button next to "
-                "Template YAML, or run Define regions to create one.",
+                "Missing Sheet Regions",
+                f"Sheet Regions file not found:\n{tpl}\n\nPick one with the Browse button next to "
+                "Sheet Regions, or run Define regions to create one.",
             )
             return
-        self.tpl_edit.setText(_display_path(tpl))
+        self.tpl_edit.setText(_pretty_path(tpl, self._tpl_root()))
 
         exam_name = self.exam_name_edit.text().strip()
         if not exam_name:
@@ -768,9 +962,15 @@ class Launcher(QMainWindow):
         sheet_pdf: Path | None = None
         sheet_str = self.sheet_edit.text().strip()
         if sheet_str:
-            candidate = Path(sheet_str)
-            if not candidate.is_absolute():
-                candidate = (HERE / candidate).resolve()
+            candidate = _resolve_against_roots(
+                sheet_str, self._sheet_resolution_roots(),
+                extensions=(".pdf",),
+            )
+            if candidate is None:
+                # Fall back to the typed value for the warning log below.
+                candidate = Path(sheet_str)
+                if not candidate.is_absolute():
+                    candidate = (HERE / candidate).resolve()
             if candidate.exists():
                 sheet_pdf = candidate
             else:
@@ -789,7 +989,6 @@ class Launcher(QMainWindow):
             "exam_name": exam_name,
             "sheet_pdf": sheet_pdf,
             "skip_existing": self.skip_existing_cb.isChecked(),
-            "include_mc_pages": self.include_mc_cb.isChecked(),
         }
 
         if self._last_pdf == pdf and self._last_pages is not None:
@@ -873,8 +1072,6 @@ class Launcher(QMainWindow):
             )
         if params["skip_existing"]:
             self._append_log("Skip-existing: on.")
-        if not params["include_mc_pages"]:
-            self._append_log("Include MC pages: off.")
 
         log_signal = self.log_signal
         busy_signal = self.busy_signal
@@ -904,7 +1101,6 @@ class Launcher(QMainWindow):
                         exam_name_override=params["exam_name"],
                         sheet_pdf=params["sheet_pdf"],
                         skip_existing=params["skip_existing"],
-                        include_mc_pages=params["include_mc_pages"],
                         cached_pages=cached_pages,
                         extra_skipped=extra_skipped,
                     )
@@ -917,28 +1113,6 @@ class Launcher(QMainWindow):
                 busy_signal.emit(False, "")
 
         self._run_in_thread(work)
-
-    # ---------- open output ----------
-
-    def _open_output(self) -> None:
-        target = OUTPUT_DIR
-        exam_name = self.exam_name_edit.text().strip()
-        if not exam_name:
-            pdf_str = self.pdf_edit.text().strip()
-            if pdf_str:
-                exam_name = Path(pdf_str).stem
-        if exam_name:
-            sub = OUTPUT_DIR / exam_name
-            if sub.is_dir():
-                target = sub
-        if not target.exists():
-            QMessageBox.information(self, "Not yet", f"{target} doesn't exist yet — run Extract first.")
-            return
-        try:
-            os.startfile(str(target))
-        except OSError as e:
-            QMessageBox.critical(self, "Could not open", str(e))
-
 
 def main() -> None:
     app = QApplication(sys.argv)

@@ -121,7 +121,7 @@ class ScanResultView(QWidget):
         outer.addWidget(self.banner)
 
         self._header_label = QLabel("Run Check scan to index this PDF.")
-        self._header_label.setStyleSheet("color: palette(mid);")
+        self._header_label.setStyleSheet("color: palette(placeholder-text);")
         outer.addWidget(self._header_label)
 
         self._tree = QTreeWidget()
@@ -143,6 +143,10 @@ class ScanResultView(QWidget):
         self._tree.clear()
         self.banner.hide()
         self._header_label.setText("Run Check scan to index this PDF.")
+        # Re-apply the muted-hint styling — set_pages clears it when it
+        # renders a roster, so without this the hint reads as full-weight
+        # body text the next time the view goes idle.
+        self._header_label.setStyleSheet("color: palette(placeholder-text);")
 
     def set_pages(self, pages: list[PageRecord],
                   skipped: set[str] | None = None) -> None:
@@ -179,7 +183,7 @@ class ScanResultView(QWidget):
             page_count = sum(len(g.pages) for g in roster)
             n_skipped = sum(1 for g in roster if g.folder_name in skipped)
             skip_note = (
-                f", <span style='color: palette(mid);'>{n_skipped} skipped</span>"
+                f", <span style='color: palette(placeholder-text);'>{n_skipped} skipped</span>"
                 if n_skipped else ""
             )
             self._header_label.setText(
@@ -190,7 +194,7 @@ class ScanResultView(QWidget):
             self._header_label.setStyleSheet("")
         else:
             self._header_label.setText("No students matched.")
-            self._header_label.setStyleSheet("color: palette(mid);")
+            self._header_label.setStyleSheet("color: palette(placeholder-text);")
 
         self._tree.clear()
         roster.sort(key=lambda g: g.student_name.lower())
