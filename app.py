@@ -69,6 +69,17 @@ QMARK_SHEET_PATH = os.environ.get("QMARK_SHEET_PATH", "").strip()
 QMARK_CLASS_PATH = os.environ.get("QMARK_CLASS_PATH", "").strip()
 
 
+def _display_path(p) -> str:
+    """Forward-slash a path for UI display. Windows accepts either
+    separator, so this is purely cosmetic — keeps the PDF / template /
+    sheet line edits looking consistent regardless of whether the value
+    came from a QFileDialog (backslashes), a qmark env var (already
+    forward-slashed), or a default Path object."""
+    if not p:
+        return ""
+    return str(p).replace("\\", "/")
+
+
 def _qmark_output_name() -> str:
     """Per-extraction subfolder name handed off by the dashboard.
 
@@ -132,19 +143,21 @@ class Launcher(QMainWindow):
         self._build()
         self.log_signal.connect(self._append_log)
         self.busy_signal.connect(self._set_busy)
-        self.tpl_path_signal.connect(self.tpl_edit.setText)
+        self.tpl_path_signal.connect(
+            lambda p: self.tpl_edit.setText(_display_path(p))
+        )
         self.pages_indexed_signal.connect(self._on_pages_indexed)
 
         default_pdf = HERE / DEFAULT_PDF_REL
         if default_pdf.exists():
-            self.pdf_edit.setText(str(default_pdf))
+            self.pdf_edit.setText(_display_path(default_pdf))
             self.exam_name_edit.setText(default_pdf.stem)
             self._autofill_template()
         qmark_output = _qmark_output_name()
         if qmark_output:
             self.exam_name_edit.setText(qmark_output)
         if QMARK_SHEET_PATH:
-            self.sheet_edit.setText(QMARK_SHEET_PATH)
+            self.sheet_edit.setText(_display_path(QMARK_SHEET_PATH))
 
     # ---------- layout ----------
 
@@ -326,7 +339,7 @@ class Launcher(QMainWindow):
             pdf = (HERE / pdf).resolve()
         for c in self._template_search_paths(pdf.stem):
             if c.exists():
-                self.tpl_edit.setText(str(c))
+                self.tpl_edit.setText(_display_path(c))
                 return c
         return None
 
@@ -345,7 +358,7 @@ class Launcher(QMainWindow):
             "PDF files (*.pdf);;All files (*.*)",
         )
         if picked:
-            self.pdf_edit.setText(picked)
+            self.pdf_edit.setText(_display_path(picked))
             # When running under qmark, the dashboard's <Class>_<Assignment>
             # is the canonical output-folder name — don't clobber it with
             # the PDF stem.
@@ -366,7 +379,7 @@ class Launcher(QMainWindow):
             "YAML files (*.yaml *.yml);;All files (*.*)",
         )
         if picked:
-            self.tpl_edit.setText(picked)
+            self.tpl_edit.setText(_display_path(picked))
 
     def _browse_sheet(self) -> None:
         qmark_sheets = os.environ.get("QMARK_SHEETS_DIR", "").strip()
@@ -382,7 +395,7 @@ class Launcher(QMainWindow):
             "PDF files (*.pdf);;All files (*.*)",
         )
         if picked:
-            self.sheet_edit.setText(picked)
+            self.sheet_edit.setText(_display_path(picked))
 
     def _run_in_thread(self, work) -> None:
         threading.Thread(target=work, daemon=True).start()
@@ -663,7 +676,7 @@ class Launcher(QMainWindow):
                 "Template YAML, or run Define regions to create one.",
             )
             return
-        self.tpl_edit.setText(str(tpl))
+        self.tpl_edit.setText(_display_path(tpl))
 
         exam_name = self.exam_name_edit.text().strip()
         if not exam_name:
