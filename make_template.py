@@ -346,8 +346,9 @@ class TemplateEditor(QMainWindow):
         self.mc_toggle_btn.setCheckable(True)
         self.mc_toggle_btn.setToolTip(
             "Flag the current packet page as a multiple-choice answer "
-            "sheet. Extract will render the whole page (no bboxes) so "
-            "the MC grader can display it alongside the answer cells."
+            "sheet. Extract renders the whole page for the MC grader. "
+            "You can still draw question zones on an MC page — each is "
+            "cropped as a normal question on top of the whole-page capture."
         )
         self.mc_toggle_btn.clicked.connect(self._toggle_mc_page)
         side_lay.addWidget(self.mc_toggle_btn)
@@ -622,10 +623,11 @@ class TemplateEditor(QMainWindow):
 
         page_in_packet = self._current_page_in_packet()
         is_mc_page = page_in_packet in self.mc_pages
-        regions_for_page = (
-            [] if is_mc_page
-            else [r for r in self.regions if r["page"] == page_in_packet]
-        )
+        # A page can be BOTH a whole-page MC capture and carry question
+        # zones (e.g. a written question sharing the sheet with the MC
+        # bubbles). The MC flag and the bboxes are independent, so always
+        # show whatever regions were drawn on this page.
+        regions_for_page = [r for r in self.regions if r["page"] == page_in_packet]
         self.page_view.set_page(pixmap, regions_for_page)
 
         n_pages = len(self._current_group().pages)
@@ -633,9 +635,10 @@ class TemplateEditor(QMainWindow):
         self.page_label.setText(
             f"Packet page {page_in_packet} of {n_pages}  (PDF page {pdf_pg}){suffix}"
         )
-        self.defining_label.setText(
-            "MC (whole page)" if is_mc_page else _code_for(self.next_q_num)
-        )
+        # The next rectangle drawn is always a question zone — even on an
+        # MC page — so surface the upcoming Q code. The MC state shows via
+        # the toggle button and the page-label suffix above.
+        self.defining_label.setText(_code_for(self.next_q_num))
         # Reflect the current page's MC state without re-firing the toggle.
         self.mc_toggle_btn.blockSignals(True)
         self.mc_toggle_btn.setChecked(is_mc_page)
@@ -644,10 +647,10 @@ class TemplateEditor(QMainWindow):
     # ---------- Region handling ----------
 
     def _on_rect_drawn(self, nx0: float, ny0: float, nx1: float, ny1: float) -> None:
+        # Question zones are allowed on any page, including MC pages — the
+        # whole-page MC capture and the bbox crop coexist in extract output
+        # (MC_p<N>.png next to the question's Q<code>.png).
         page_in_packet = self._current_page_in_packet()
-        if page_in_packet in self.mc_pages:
-            # MC pages are whole-page captures — bboxes don't apply here.
-            return
         self.regions.append({
             "q": _code_for(self.next_q_num),
             "page": page_in_packet,
@@ -660,16 +663,11 @@ class TemplateEditor(QMainWindow):
     def _toggle_mc_page(self, checked: bool) -> None:
         if not self.groups:
             return
+        # The MC flag and question zones are independent — toggling MC
+        # leaves any bboxes already drawn on this page untouched, so a page
+        # can be a whole-page capture and still crop a stray question.
         page_in_packet = self._current_page_in_packet()
         if checked:
-            # Marking as MC drops any bboxes the user may already have
-            # drawn on this page (whole-page capture supersedes regions),
-            # then renumbers so question codes stay contiguous.
-            before = len(self.regions)
-            self.regions = [r for r in self.regions if r["page"] != page_in_packet]
-            if len(self.regions) != before:
-                self._renumber()
-                self._refresh_region_list()
             self.mc_pages.add(page_in_packet)
         else:
             self.mc_pages.discard(page_in_packet)
