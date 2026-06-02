@@ -15,10 +15,11 @@ from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
+import os
 
 import numpy as np
 import pymupdf
-from PySide6.QtCore import Qt, QSize
+from PySide6.QtCore import Qt, QSize, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPushButton,
     QScrollArea,
     QSpinBox,
     QVBoxLayout,
@@ -104,13 +106,47 @@ def _decoded_names(pages: list[PageRecord]) -> set[str]:
     return {p.student_name for p in pages if p.student_name and p.qr_status != "unknown"}
 
 
+def _infer_packet_size(pages: list[PageRecord]) -> int:
+    """Best guess at one student's packet length — the Fill-down default.
+
+    The modal ``pages_total`` among QR-decoded packets in this scan is the
+    most reliable signal. If nothing decoded (every page is an orphan),
+    fall back to the worksheet PDF the dashboard handed us via
+    ``QMARK_SHEET_PATH`` — its page count is exactly one packet. Returns a
+    small default when neither is available; the teacher sets the spinner
+    by hand in that case.
+    """
+    totals = [p.pages_total for p in pages if p.pages_total]
+    if totals:
+        return Counter(totals).most_common(1)[0][0]
+    sheet = os.environ.get("QMARK_SHEET_PATH", "").strip()
+    if sheet:
+        try:
+            doc = pymupdf.open(sheet)
+            try:
+                n = len(doc)
+            finally:
+                doc.close()
+            if n > 0:
+                return n
+        except Exception:
+            pass
+    return 2
+
+
 class _OrphanRow(QWidget):
     """One row: thumbnail + page label + student name + packet page spinner."""
+
+    # Emitted when the row's "Fill down" button is clicked; the dialog
+    # connects it to a handler bound to this row's index.
+    fill_requested = Signal()
 
     def __init__(self, page_number: int, default_packet_page: int,
                  thumb: QPixmap, name_choices: list[str],
                  preset_name: str = "",
-                 hint_text: str | None = None) -> None:
+                 hint_text: str | None = None,
+                 packet_max: int = 9,
+                 enable_fill_down: bool = False) -> None:
         super().__init__()
         self.page_number = page_number
         self._preset_name = preset_name
@@ -153,11 +189,21 @@ class _OrphanRow(QWidget):
         page_row = QHBoxLayout()
         page_row.addWidget(QLabel("Packet page:"))
         self.packet_sb = QSpinBox()
-        self.packet_sb.setRange(1, 9)
+        self.packet_sb.setRange(1, max(9, packet_max))
         self.packet_sb.setValue(default_packet_page)
         self.packet_sb.setMaximumWidth(70)
         page_row.addWidget(self.packet_sb)
         page_row.addStretch(1)
+        if enable_fill_down:
+            self.fill_btn = QPushButton("Fill down ↓")
+            self.fill_btn.setToolTip(
+                "Assign this name to this page and the following pages in "
+                "scan order — up to 'Pages per packet' at the top — and "
+                "number them packet page 1, 2, 3 … (this page becomes "
+                "packet page 1)."
+            )
+            self.fill_btn.clicked.connect(self.fill_requested)
+            page_row.addWidget(self.fill_btn)
         right.addLayout(page_row)
 
         if hint_text is None:
@@ -175,8 +221,16 @@ class _OrphanRow(QWidget):
     def chosen_name(self) -> str:
         return self.name_cb.currentText().strip()
 
+    def set_name(self, name: str) -> None:
+        # Editable combo, so setCurrentText works even for a name that
+        # isn't among the roster suggestions.
+        self.name_cb.setCurrentText(name)
+
     def packet_page(self) -> int:
         return self.packet_sb.value()
+
+    def set_packet_page(self, page: int) -> None:
+        self.packet_sb.setValue(min(page, self.packet_sb.maximum()))
 
     def is_cleared(self) -> bool:
         """True when the user blanked a name that started non-blank.
@@ -241,7 +295,10 @@ class OrphanRecoveryDialog(QDialog):
                 "via QR.</b><br>"
                 "Pick which student each one belongs to. Same first name on "
                 "multiple pages combines those pages into one packet (in PDF "
-                "page order)."
+                "page order).<br>"
+                "<b>Tip:</b> type a student's name on their first page, then "
+                "click <b>Fill down ↓</b> to hand them that page and the next "
+                "few in scan order — set how many in <b>Pages per packet</b>."
             )
         header.setWordWrap(True)
         outer.addWidget(header)
@@ -263,6 +320,25 @@ class OrphanRecoveryDialog(QDialog):
         class_row.addWidget(self.class_edit)
         class_row.addStretch(1)
         outer.addLayout(class_row)
+
+        # Fill-down config (orphan mode only): how many consecutive pages
+        # one click claims for a student. Default to this scan's inferred
+        # packet size so the common "all packets the same length" case
+        # needs no adjustment.
+        self.packet_size_sb = None
+        if not edit_mode and self._target_pages:
+            packet_cap = max(9, len(self._target_pages))
+            fill_row = QHBoxLayout()
+            fill_row.addWidget(QLabel("Pages per packet (for Fill down):"))
+            self.packet_size_sb = QSpinBox()
+            self.packet_size_sb.setRange(1, packet_cap)
+            self.packet_size_sb.setValue(
+                min(max(1, _infer_packet_size(pages)), packet_cap)
+            )
+            self.packet_size_sb.setMaximumWidth(70)
+            fill_row.addWidget(self.packet_size_sb)
+            fill_row.addStretch(1)
+            outer.addLayout(fill_row)
 
         # Roster minus already-decoded names = suggested choices. In
         # edit mode, the current student is allowed too (otherwise the
@@ -298,7 +374,15 @@ class OrphanRecoveryDialog(QDialog):
                 row = _OrphanRow(
                     p.pdf_page_number, default_packet, thumb, suggestions,
                     preset_name=preset_name, hint_text=hint,
+                    packet_max=max(9, len(self._target_pages)),
+                    enable_fill_down=not edit_mode,
                 )
+                if not edit_mode:
+                    # Default-arg binds the row's index at definition time so
+                    # each button reports its own row, not the loop's last.
+                    row.fill_requested.connect(
+                        lambda i=len(self._rows): self._fill_down_from(i)
+                    )
                 scroll_layout.addWidget(row)
                 self._rows.append(row)
             scroll_layout.addStretch(1)
@@ -315,6 +399,33 @@ class OrphanRecoveryDialog(QDialog):
         self._apply_btn.clicked.connect(self._on_apply)
         buttons.rejected.connect(self.reject)
         outer.addWidget(buttons)
+
+    def _fill_down_from(self, start_idx: int) -> None:
+        """Claim a run of consecutive pages for the name on row ``start_idx``.
+
+        Copies that row's name onto it and the following rows (scan order,
+        as displayed), up to 'Pages per packet', numbering them packet page
+        1, 2, 3 … So naming a student's cover page and clicking Fill down
+        assigns their whole packet in one go. Stops cleanly at the end of
+        the orphan list — a short tail just fills fewer pages.
+        """
+        if self.packet_size_sb is None:
+            return
+        if not (0 <= start_idx < len(self._rows)):
+            return
+        name = self._rows[start_idx].chosen_name()
+        if not name:
+            QMessageBox.information(
+                self, "Name needed first",
+                "Type the student's first name on this row, then click "
+                "Fill down.",
+            )
+            return
+        count = self.packet_size_sb.value()
+        end_idx = min(start_idx + count, len(self._rows))
+        for packet_page, i in enumerate(range(start_idx, end_idx), start=1):
+            self._rows[i].set_name(name)
+            self._rows[i].set_packet_page(packet_page)
 
     def _on_apply(self) -> None:
         cls = self.class_edit.text().strip()
