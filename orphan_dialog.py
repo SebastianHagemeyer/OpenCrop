@@ -20,7 +20,7 @@ import os
 import numpy as np
 import pymupdf
 from PySide6.QtCore import Qt, QSize, Signal
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QGuiApplication, QImage, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -44,6 +44,12 @@ _THUMB_W = 220
 # _THUMB_W; keeps the title text + QR area legible without burning
 # memory on full-resolution renders for pages we'll throw away.
 _THUMB_DPI = 60
+
+# DPI for the click-to-enlarge popup. Much higher than the row thumbnail
+# so the printed Name field and the student's handwriting are legible;
+# only one page is ever rendered at a time, on demand, so the extra cost
+# is a single ~0.3-0.5s render per click.
+_ENLARGE_DPI = 200
 
 
 def _load_roster_names(class_path: Path | None) -> list[str]:
@@ -134,12 +140,77 @@ def _infer_packet_size(pages: list[PageRecord]) -> int:
     return 2
 
 
+class _ClickableLabel(QLabel):
+    """A QLabel that emits ``clicked`` on a left-button press.
+
+    Backs the orphan thumbnail so clicking the small row render opens
+    the enlarged, readable page popup.
+    """
+
+    clicked = Signal()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class _PagePopup(QWidget):
+    """Click-to-dismiss enlargement of a single orphan page.
+
+    Shown as a ``Qt.Popup`` so a click anywhere outside dismisses it; a
+    click on the page itself or Esc closes it too. The teacher can flick
+    a page open to read the handwritten name, then click away without
+    hunting for a Close button. Rendered on demand at ``_ENLARGE_DPI``
+    (one page per click) so pen strokes stay sharp.
+    """
+
+    def __init__(self, pixmap: QPixmap, page_number: int,
+                 parent: QWidget | None = None) -> None:
+        super().__init__(parent, Qt.Popup)
+        self.setObjectName("pagePopup")
+        self.setStyleSheet("#pagePopup { border: 2px solid palette(highlight); }")
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(2, 2, 2, 2)
+        lay.setSpacing(0)
+
+        cap = QLabel(
+            f"PDF page {page_number}   ·   click anywhere or press Esc to close"
+        )
+        cap.setAlignment(Qt.AlignCenter)
+        cap.setStyleSheet(
+            "background: palette(highlight); color: palette(highlighted-text);"
+            " padding: 4px; font-weight: bold;"
+        )
+        lay.addWidget(cap)
+
+        img = QLabel()
+        img.setPixmap(pixmap)
+        img.setFixedSize(pixmap.size())
+        lay.addWidget(img)
+
+    def mousePressEvent(self, event) -> None:
+        self.close()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
+
+
 class _OrphanRow(QWidget):
     """One row: thumbnail + page label + student name + packet page spinner."""
 
     # Emitted when the row's "Fill down" button is clicked; the dialog
     # connects it to a handler bound to this row's index.
     fill_requested = Signal()
+
+    # Emitted when the row's thumbnail is clicked; the dialog opens an
+    # enlarged, readable popup of that page so the handwritten name is
+    # legible.
+    enlarge_requested = Signal()
 
     def __init__(self, page_number: int, default_packet_page: int,
                  thumb: QPixmap, name_choices: list[str],
@@ -155,11 +226,25 @@ class _OrphanRow(QWidget):
         row.setContentsMargins(4, 4, 4, 4)
         row.setSpacing(12)
 
-        thumb_lbl = QLabel()
-        thumb_lbl.setPixmap(thumb)
-        thumb_lbl.setFixedSize(thumb.size())
-        thumb_lbl.setStyleSheet("border: 1px solid palette(mid);")
-        row.addWidget(thumb_lbl)
+        # Clickable thumbnail → enlarged, readable popup. The 60-DPI row
+        # render is too small to read the handwritten name, so clicking it
+        # opens a full-size view (see enlarge_requested / _show_enlarged).
+        thumb_col = QVBoxLayout()
+        thumb_col.setSpacing(2)
+        self.thumb_lbl = _ClickableLabel()
+        self.thumb_lbl.setPixmap(thumb)
+        self.thumb_lbl.setFixedSize(thumb.size())
+        self.thumb_lbl.setCursor(Qt.PointingHandCursor)
+        self.thumb_lbl.setToolTip("Click to enlarge — read the handwritten name")
+        self.thumb_lbl.setStyleSheet("border: 1px solid palette(mid);")
+        self.thumb_lbl.clicked.connect(self.enlarge_requested)
+        thumb_col.addWidget(self.thumb_lbl)
+        zoom_hint = QLabel("🔍 click to enlarge")
+        zoom_hint.setAlignment(Qt.AlignHCenter)
+        zoom_hint.setStyleSheet("color: palette(mid);")
+        thumb_col.addWidget(zoom_hint)
+        thumb_col.addStretch(1)
+        row.addLayout(thumb_col)
 
         right = QVBoxLayout()
         right.setSpacing(6)
@@ -377,6 +462,11 @@ class OrphanRecoveryDialog(QDialog):
                     packet_max=max(9, len(self._target_pages)),
                     enable_fill_down=not edit_mode,
                 )
+                # Default-arg binds this row's PDF page so the popup shows
+                # the right page (same pattern as fill_requested below).
+                row.enlarge_requested.connect(
+                    lambda pn=p.pdf_page_number: self._show_enlarged(pn)
+                )
                 if not edit_mode:
                     # Default-arg binds the row's index at definition time so
                     # each button reports its own row, not the loop's last.
@@ -426,6 +516,48 @@ class OrphanRecoveryDialog(QDialog):
         for packet_page, i in enumerate(range(start_idx, end_idx), start=1):
             self._rows[i].set_name(name)
             self._rows[i].set_packet_page(packet_page)
+
+    def _show_enlarged(self, page_number: int) -> None:
+        """Render one orphan page large and sharp, then show it in a
+        click-to-dismiss popup so the teacher can read the handwritten
+        name. One on-demand render per click; the row thumbnails stay at
+        their low DPI. A bad render is swallowed rather than killing the
+        dialog."""
+        try:
+            doc = pymupdf.open(self._pdf_path)
+            try:
+                page = doc[page_number - 1]
+                zoom = _ENLARGE_DPI / 72.0
+                pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
+                pm = QPixmap.fromImage(
+                    QImage(pix.samples, pix.width, pix.height, pix.stride,
+                           QImage.Format_RGB888).copy()
+                )
+            finally:
+                doc.close()
+        except Exception:
+            return
+
+        # Scale to fit the screen so a full-height A4 render isn't clipped;
+        # leave headroom for the caption bar and window-manager margins.
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            max_w = int(avail.width() * 0.92)
+            max_h = int(avail.height() * 0.9) - 48
+            if pm.width() > max_w or pm.height() > max_h:
+                pm = pm.scaled(max_w, max_h, Qt.KeepAspectRatio,
+                               Qt.SmoothTransformation)
+
+        # Hold a reference so the popup isn't garbage-collected; each click
+        # replaces the previous (already-dismissed) one.
+        self._enlarge_popup = _PagePopup(pm, page_number, self)
+        self._enlarge_popup.adjustSize()
+        if screen is not None:
+            geo = self._enlarge_popup.frameGeometry()
+            geo.moveCenter(screen.availableGeometry().center())
+            self._enlarge_popup.move(geo.topLeft())
+        self._enlarge_popup.show()
 
     def _on_apply(self) -> None:
         cls = self.class_edit.text().strip()
