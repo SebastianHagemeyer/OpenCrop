@@ -58,6 +58,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -675,8 +676,31 @@ class TemplateEditor(QMainWindow):
 
     def _refresh_region_list(self) -> None:
         self.region_list.clear()
-        for r in self.regions:
-            self.region_list.addItem(f"{r['q']}  page {r['page']}")
+        # Question rows stay 1:1 with self.regions, in order, so the stored
+        # index drives deletion. Tag any question sharing its page with an
+        # MC capture (a page can be both a whole-page MC grab and carry
+        # question zones).
+        for idx, r in enumerate(self.regions):
+            text = f"{r['q']}  page {r['page']}"
+            if r["page"] in self.mc_pages:
+                text += "   · on MC page"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, ("region", idx))
+            self.region_list.addItem(item)
+        # MC pages with no question zones are whole-page captures that
+        # wouldn't otherwise appear — list them on their own so every page
+        # flagged MC is visible (and removable) here.
+        pages_with_regions = {r["page"] for r in self.regions}
+        for p in sorted(self.mc_pages):
+            if p in pages_with_regions:
+                continue
+            item = QListWidgetItem(f"MC page {p}   — whole-page capture")
+            item.setData(Qt.UserRole, ("mc", p))
+            f = item.font()
+            f.setItalic(True)
+            item.setFont(f)
+            item.setForeground(QColor("#888888"))
+            self.region_list.addItem(item)
 
     def _renumber(self) -> None:
         for i, r in enumerate(self.regions, start=1):
@@ -684,11 +708,22 @@ class TemplateEditor(QMainWindow):
         self.next_q_num = len(self.regions) + 1
 
     def _delete_selected(self) -> None:
-        row = self.region_list.currentRow()
-        if row < 0:
+        item = self.region_list.currentItem()
+        if item is None:
             return
-        del self.regions[row]
-        self._renumber()
+        data = item.data(Qt.UserRole)
+        if not data:
+            return
+        kind, ref = data
+        if kind == "region":
+            del self.regions[ref]
+            self._renumber()
+        elif kind == "mc":
+            # Removing an MC-page row just clears that whole-page MC flag;
+            # the toggle button re-syncs when _render_current_page runs.
+            self.mc_pages.discard(ref)
+        else:
+            return
         self._refresh_region_list()
         self._render_current_page()
 
