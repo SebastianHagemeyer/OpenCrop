@@ -372,7 +372,10 @@ class OrphanRecoveryDialog(QDialog):
                 "Change the name to reassign a page to a different student, "
                 "or blank the name to send it back to the orphan list. The "
                 "packet-page spinner controls the page's position inside "
-                "the packet."
+                "the packet.<br>"
+                "<b>Tip:</b> wrong student took this paper? Type the right "
+                "name on the first page and click <b>Fill down ↓</b> to move "
+                "the whole packet across in one go."
             )
         else:
             header = QLabel(
@@ -406,20 +409,20 @@ class OrphanRecoveryDialog(QDialog):
         class_row.addStretch(1)
         outer.addLayout(class_row)
 
-        # Fill-down config (orphan mode only): how many consecutive pages
-        # one click claims for a student. Default to this scan's inferred
-        # packet size so the common "all packets the same length" case
-        # needs no adjustment.
+        # Fill-down config: how many consecutive pages one click claims for
+        # a student. Orphan mode defaults to this scan's inferred packet
+        # size; edit mode defaults to the whole set being edited, so moving
+        # a mis-taken packet to another student is a single click.
         self.packet_size_sb = None
-        if not edit_mode and self._target_pages:
+        if self._target_pages:
             packet_cap = max(9, len(self._target_pages))
+            default_size = (len(self._target_pages) if edit_mode
+                            else _infer_packet_size(pages))
             fill_row = QHBoxLayout()
             fill_row.addWidget(QLabel("Pages per packet (for Fill down):"))
             self.packet_size_sb = QSpinBox()
             self.packet_size_sb.setRange(1, packet_cap)
-            self.packet_size_sb.setValue(
-                min(max(1, _infer_packet_size(pages)), packet_cap)
-            )
+            self.packet_size_sb.setValue(min(max(1, default_size), packet_cap))
             self.packet_size_sb.setMaximumWidth(70)
             fill_row.addWidget(self.packet_size_sb)
             fill_row.addStretch(1)
@@ -460,14 +463,14 @@ class OrphanRecoveryDialog(QDialog):
                     p.pdf_page_number, default_packet, thumb, suggestions,
                     preset_name=preset_name, hint_text=hint,
                     packet_max=max(9, len(self._target_pages)),
-                    enable_fill_down=not edit_mode,
+                    enable_fill_down=self.packet_size_sb is not None,
                 )
                 # Default-arg binds this row's PDF page so the popup shows
                 # the right page (same pattern as fill_requested below).
                 row.enlarge_requested.connect(
                     lambda pn=p.pdf_page_number: self._show_enlarged(pn)
                 )
-                if not edit_mode:
+                if self.packet_size_sb is not None:
                     # Default-arg binds the row's index at definition time so
                     # each button reports its own row, not the loop's last.
                     row.fill_requested.connect(
